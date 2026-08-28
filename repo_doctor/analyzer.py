@@ -36,7 +36,7 @@ def analyze(result: ScanResult) -> None:
     for item in failed:
         result.potential_bugs.append(f"{item.name} failed with exit code {item.exit_code}.")
     for item in unavailable:
-        state = item.approval_status or "UNKNOWN"
+        state = item.approval_status or item.toolhub_outcome or "UNKNOWN"
         result.potential_bugs.append(
             f"{item.name} could not run because ToolHub request "
             f"{item.request_id or 'unknown'} is {state}."

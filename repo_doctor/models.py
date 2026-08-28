@@ -27,6 +27,11 @@ class CommandResult:
     message: str = ""
     executed: bool = True
     trace_id: str | None = None
+    toolhub_outcome: str | None = None
+    resume_tool: str | None = None
+    expires_at: str | None = None
+    error_code: str | None = None
+    error_retryable: bool | None = None
 
     @property
     def passed(self) -> bool:
@@ -60,10 +65,15 @@ class PatchMutationResult:
     request_id: str | None = None
     approval_status: str | None = None
     message: str = ""
+    toolhub_outcome: str | None = None
+    resume_tool: str | None = None
+    expires_at: str | None = None
+    error_code: str | None = None
+    error_retryable: bool | None = None
 
     @property
     def approval_required(self) -> bool:
-        return not self.executed and self.approval_status == "PENDING"
+        return self.toolhub_outcome == "APPROVAL_REQUIRED"
 
 
 @dataclass(frozen=True)

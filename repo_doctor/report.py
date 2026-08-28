@@ -16,7 +16,11 @@ def _results(items: list[CommandResult], kind: str) -> str:
             status = "APPROVAL REQUIRED"
             approval = f"Request ID: {item.request_id or 'unknown'}\n{item.message}".strip()
         elif not item.executed:
-            status = item.approval_status or "UNAVAILABLE"
+            status = (
+                "UNAVAILABLE"
+                if item.error_code == "REQUEST_NOT_FOUND"
+                else item.approval_status or item.toolhub_outcome or "UNAVAILABLE"
+            )
             approval = f"Request ID: {item.request_id or 'unknown'}\n{item.message}".strip()
         else:
             status = "PASS" if item.passed else "FAIL"
@@ -27,7 +31,8 @@ def _results(items: list[CommandResult], kind: str) -> str:
         output = redact_sensitive_text(combined_output.strip()[-4000:]) or "(no output)"
         heading = f"### {item.name}: {status}"
         outcome = f"exit {item.exit_code}" if item.executed else "not executed"
-        detail = f"`{' '.join(item.command)}` - {item.duration:.2f}s, {outcome}"
+        trace = f", trace {item.trace_id}" if item.trace_id else ""
+        detail = f"`{' '.join(item.command)}` - {item.duration:.2f}s, {outcome}{trace}"
         blocks.append(f"{heading}\n\n{detail}\n\n```text\n{output}\n```")
     return "\n\n".join(blocks)
 
