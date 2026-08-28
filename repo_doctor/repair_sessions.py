@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -18,11 +19,17 @@ from .security import redact_sensitive_text
 from .sessions import (
     MAX_SESSION_BYTES,
     SessionError,
+    encode_session_payload,
     find_session_file,
     session_file_path,
 )
+from .toolhub_contract import (
+    ContractOutcome,
+    RequestStatusResult,
+    expected_resume_tool,
+)
 
-REPAIR_SESSION_SCHEMA_VERSION = 1
+REPAIR_SESSION_SCHEMA_VERSION = 2
 MAX_REPAIR_OUTPUT_CHARS = 4_000
 MAX_REPAIR_COMMANDS = 32
 MAX_REPAIR_OPERATIONS = 64
@@ -58,6 +65,7 @@ class RepairOperationStatus(StrEnum):
     EXPIRED = "expired"
     CONSUMED = "consumed"
     CONFLICT = "conflict"
+    REFUSED = "refused"
     UNKNOWN = "unknown"
 
 
@@ -83,7 +91,12 @@ class RepairOperation:
     stderr: str = ""
     timed_out: bool = False
     toolhub_status: str | None = None
+    toolhub_outcome: str | None = None
+    resume_tool: str | None = None
+    expires_at: str | None = None
     trace_id: str | None = None
+    error_code: str | None = None
+    error_retryable: bool | None = None
     message: str = ""
 
 
@@ -137,7 +150,16 @@ class RepairExecutionBackend(Protocol):
 
     def __exit__(self, *exc_info: object) -> None: ...
 
-    def run_approved_mutation(self, request_id: str) -> PatchMutationResult: ...
+    def request_status(self, request_id: str) -> RequestStatusResult: ...
+
+    def run_approved_mutation(
+        self,
+        request_id: str,
+        *,
+        resume_tool: str | None = None,
+        expected_path: str,
+        expected_trace_id: str,
+    ) -> PatchMutationResult: ...
 
     def run_command(
         self,
@@ -147,7 +169,13 @@ class RepairExecutionBackend(Protocol):
         timeout: int = 120,
     ) -> CommandResult: ...
 
-    def run_approved(self, request_id: str, *, name: str) -> CommandResult: ...
+    def run_approved(
+        self,
+        request_id: str,
+        *,
+        name: str,
+        resume_tool: str | None = None,
+    ) -> CommandResult: ...
 
     def git_diff(self, path: str | None = None, staged: bool = False) -> GitDiffResult: ...
 
@@ -185,16 +213,20 @@ def record_patch_request(session: RepairSession, result: PatchMutationResult) ->
         raise SessionError("Repair patch request has already been recorded.")
     if result.path != session.target_file:
         raise SessionError("ToolHub returned a different mutation target path.")
-    if result.executed:
+    if result.toolhub_outcome == ContractOutcome.SUCCEEDED.value and result.executed:
         status = RepairOperationStatus.COMPLETED
         phase = RepairPhase.PATCH_APPLIED
-    elif result.approval_required and result.request_id:
+    elif result.toolhub_outcome == ContractOutcome.APPROVAL_REQUIRED.value:
+        if not result.request_id:
+            raise SessionError("APPROVAL_REQUIRED patch has no ToolHub request ID.")
+        _require_contract_handle(result.resume_tool, result.expires_at, "filesystem.apply_patch")
         status = RepairOperationStatus.PENDING
         phase = RepairPhase.PATCH_PENDING
     else:
-        status = _refusal_status(result.approval_status)
+        status = _operation_status_from_outcome(result.toolhub_outcome)
         phase = _patch_refusal_phase(status)
-    message = _result_message(result.approval_status, result.executed, result.message)
+    trace_id = _required_text(result.trace_id, "Patch trace_id")
+    message = _safe_text(result.message)
     session.operations.append(
         RepairOperation(
             operation_id="patch-1",
@@ -205,21 +237,27 @@ def record_patch_request(session: RepairSession, result: PatchMutationResult) ->
             target_file=session.target_file,
             expected_hash=session.expected_hash,
             toolhub_status=_stored_toolhub_status(result.approval_status),
-            trace_id=result.trace_id,
+            toolhub_outcome=result.toolhub_outcome,
+            resume_tool=result.resume_tool,
+            expires_at=result.expires_at,
+            trace_id=trace_id,
+            error_code=result.error_code,
+            error_retryable=result.error_retryable,
             message=message,
         )
     )
-    session.patch_trace_id = result.trace_id
+    session.patch_trace_id = trace_id
     session.patch_new_hash = result.new_hash
     session.phase = phase
     if phase is RepairPhase.ERROR:
         session.error = message or "ToolHub returned an unknown patch approval state."
 
 
-def record_patch_conflict(session: RepairSession, message: str) -> None:
+def record_patch_conflict(session: RepairSession, error: MutationConflictError | str) -> None:
     """Persist a pre-request optimistic-concurrency conflict."""
     session.phase = RepairPhase.PATCH_CONFLICT
-    session.error = _safe_text(message)
+    session.error = _safe_text(str(error))
+    session.patch_trace_id = getattr(error, "trace_id", None)
     if not session.operations:
         session.operations.append(
             RepairOperation(
@@ -229,6 +267,9 @@ def record_patch_conflict(session: RepairSession, message: str) -> None:
                 name="AI repair patch",
                 target_file=session.target_file,
                 expected_hash=session.expected_hash,
+                toolhub_outcome=ContractOutcome.CONFLICT.value,
+                trace_id=getattr(error, "trace_id", None),
+                error_code=getattr(error, "error_code", None),
                 message=session.error,
             )
         )
@@ -238,13 +279,13 @@ def save_repair_session(session: RepairSession, *, root: Path | None = None) -> 
     """Validate and atomically persist repair orchestration state."""
     payload = _session_to_data(session)
     _session_from_data(payload)
+    encoded = encode_session_payload(payload)
     destination = session_file_path(session.session_id, root=root)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.parent / f".{session.session_id}.{secrets.token_hex(8)}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-            stream.write("\n")
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         try:
@@ -309,11 +350,41 @@ def resume_repair_session(
             patch = session.patch_operation
             if patch is None or patch.request_id is None:
                 raise SessionError("Pending repair has no patch approval request.")
+            status = backend.request_status(patch.request_id)
+            _record_repair_status(patch, status, "filesystem.apply_patch")
+            session.phase = _patch_phase_from_status(patch.status)
+            if patch.status in {
+                RepairOperationStatus.CONSUMED,
+                RepairOperationStatus.REFUSED,
+                RepairOperationStatus.UNKNOWN,
+            }:
+                session.error = patch.message or (
+                    "Patch approval was consumed or unavailable; Repo Doctor did not replay it."
+                )
+            persist(session)
+            if status.outcome is not ContractOutcome.APPROVAL_APPROVED:
+                return session
+            approval = status.approval
+            if approval is None:  # Contract parser already enforces this.
+                raise SessionError("APPROVAL_APPROVED status has no approval handle.")
+            if patch.trace_id is None:
+                raise SessionError("Pending patch approval has no lifecycle trace_id.")
             try:
-                result = backend.run_approved_mutation(patch.request_id)
+                result = backend.run_approved_mutation(
+                    patch.request_id,
+                    resume_tool=approval.resume_tool,
+                    expected_path=session.target_file,
+                    expected_trace_id=patch.trace_id,
+                )
             except MutationConflictError as error:
+                if error.trace_id is not None and error.trace_id != patch.trace_id:
+                    raise SessionError(
+                        "ToolHub patch conflict returned a different lifecycle trace_id."
+                    ) from error
                 patch.status = RepairOperationStatus.CONFLICT
                 patch.message = _safe_text(str(error))
+                patch.toolhub_outcome = ContractOutcome.CONFLICT.value
+                patch.error_code = error.error_code
                 session.phase = RepairPhase.PATCH_CONFLICT
                 session.error = patch.message
                 persist(session)
@@ -352,6 +423,8 @@ def render_repair_session(session: RepairSession) -> str:
         lines.append(detail)
         if operation.kind is RepairOperationKind.VERIFICATION and operation.exit_code is not None:
             lines.append(f"  exit code: {operation.exit_code}")
+        if operation.kind is RepairOperationKind.VERIFICATION and operation.trace_id:
+            lines.append(f"  trace: {operation.trace_id}")
     if session.diff_summary is not None:
         summary = session.diff_summary
         lines.append(
@@ -376,22 +449,28 @@ def _record_approved_patch_result(
         raise SessionError("ToolHub returned a different patch approval request ID.")
     if result.path and result.path != session.target_file:
         raise SessionError("ToolHub returned a different approved mutation target path.")
+    if result.trace_id != operation.trace_id or result.trace_id != session.patch_trace_id:
+        raise SessionError("ToolHub approved patch returned a different lifecycle trace_id.")
     operation.toolhub_status = _stored_toolhub_status(result.approval_status)
-    operation.trace_id = result.trace_id or operation.trace_id
-    operation.message = _result_message(
-        result.approval_status,
-        result.executed,
-        result.message,
-    )
-    session.patch_trace_id = operation.trace_id
-    if result.executed:
+    operation.toolhub_outcome = result.toolhub_outcome
+    operation.resume_tool = result.resume_tool or operation.resume_tool
+    operation.expires_at = result.expires_at or operation.expires_at
+    operation.error_code = result.error_code
+    operation.error_retryable = result.error_retryable
+    operation.message = _safe_text(result.message)
+    if result.toolhub_outcome == ContractOutcome.SUCCEEDED.value and result.executed:
         operation.status = RepairOperationStatus.COMPLETED
         session.patch_new_hash = result.new_hash
         session.phase = RepairPhase.PATCH_APPLIED
         return
-    operation.status = _refusal_status(result.approval_status)
+    operation.status = _operation_status_from_outcome(result.toolhub_outcome)
     session.phase = _patch_refusal_phase(operation.status)
-    if operation.status in {RepairOperationStatus.CONSUMED, RepairOperationStatus.UNKNOWN}:
+    if operation.status in {
+        RepairOperationStatus.CONSUMED,
+        RepairOperationStatus.REFUSED,
+        RepairOperationStatus.UNKNOWN,
+        RepairOperationStatus.FAILED,
+    }:
         session.error = operation.message or (
             "Patch approval was already consumed or unknown; Repo Doctor did not replay it."
         )
@@ -407,10 +486,24 @@ def _resume_verification_operations(
             continue
         if operation.request_id is None:
             raise SessionError("Pending verification has no ToolHub request ID.")
-        result = backend.run_approved(operation.request_id, name=operation.name)
+        status = backend.request_status(operation.request_id)
+        _record_repair_status(operation, status, "shell.run")
+        _record_unknown_verification_error(session, operation)
+        session.phase = _derive_verification_phase(session)
+        persist(session)
+        if status.outcome is not ContractOutcome.APPROVAL_APPROVED:
+            continue
+        approval = status.approval
+        if approval is None:  # Contract parser already enforces this.
+            raise SessionError("APPROVAL_APPROVED status has no approval handle.")
+        result = backend.run_approved(
+            operation.request_id,
+            name=operation.name,
+            resume_tool=approval.resume_tool,
+        )
         if result.request_id != operation.request_id:
             raise SessionError("ToolHub returned a different verification approval request ID.")
-        _record_command_result(operation, result)
+        _record_command_result(operation, result, expected_trace_id=operation.trace_id)
         _record_unknown_verification_error(session, operation)
         session.phase = _derive_verification_phase(session)
         persist(session)
@@ -447,25 +540,48 @@ def _submit_missing_verifications(
         persist(session)
 
 
-def _record_command_result(operation: RepairOperation, result: CommandResult) -> None:
+def _record_command_result(
+    operation: RepairOperation,
+    result: CommandResult,
+    *,
+    expected_trace_id: str | None = None,
+) -> None:
+    trace_id = _required_text(result.trace_id, f"{operation.name} trace_id")
+    if expected_trace_id is not None and trace_id != expected_trace_id:
+        raise SessionError("ToolHub verification lifecycle trace_id changed during resume.")
     operation.command = result.command or operation.command
     operation.exit_code = result.exit_code if result.executed else None
     operation.stdout = _safe_text(result.stdout)
     operation.stderr = _safe_text(result.stderr)
     operation.timed_out = result.timed_out
     operation.toolhub_status = _stored_toolhub_status(result.approval_status)
-    operation.trace_id = result.trace_id
-    operation.message = _result_message(
-        result.approval_status,
-        result.executed,
-        result.message,
-    )
-    if result.executed:
-        operation.status = (
-            RepairOperationStatus.COMPLETED if result.passed else RepairOperationStatus.FAILED
+    operation.toolhub_outcome = result.toolhub_outcome
+    operation.resume_tool = result.resume_tool or operation.resume_tool
+    operation.expires_at = result.expires_at or operation.expires_at
+    operation.trace_id = trace_id
+    operation.error_code = result.error_code
+    operation.error_retryable = result.error_retryable
+    operation.message = _safe_text(result.message)
+    if (
+        expected_trace_id is not None
+        and result.toolhub_outcome == ContractOutcome.APPROVAL_APPROVED.value
+    ):
+        operation.status = RepairOperationStatus.UNKNOWN
+        operation.message = _safe_text(
+            "ToolHub returned APPROVAL_APPROVED without executing the approved request."
         )
-    else:
-        operation.status = _refusal_status(result.approval_status)
+        return
+    operation.status = _operation_status_from_outcome(result.toolhub_outcome)
+    if result.toolhub_outcome == ContractOutcome.SUCCEEDED.value and result.passed:
+        operation.status = RepairOperationStatus.COMPLETED
+    elif result.toolhub_outcome in {
+        ContractOutcome.COMMAND_FAILED.value,
+        ContractOutcome.TIMED_OUT.value,
+        ContractOutcome.FAILED.value,
+    }:
+        operation.status = RepairOperationStatus.FAILED
+    if operation.status is RepairOperationStatus.PENDING:
+        _require_contract_handle(operation.resume_tool, operation.expires_at, "shell.run")
 
 
 def _record_unknown_verification_error(
@@ -475,6 +591,7 @@ def _record_unknown_verification_error(
     if operation.status in {
         RepairOperationStatus.UNKNOWN,
         RepairOperationStatus.CONSUMED,
+        RepairOperationStatus.REFUSED,
     }:
         session.error = operation.message or (
             f"ToolHub returned an unknown state for verification {operation.name}."
@@ -497,6 +614,8 @@ def _derive_verification_phase(session: RepairSession) -> RepairPhase:
         item.status in {RepairOperationStatus.UNKNOWN, RepairOperationStatus.CONSUMED}
         for item in verification
     ):
+        return RepairPhase.ERROR
+    if any(item.status is RepairOperationStatus.REFUSED for item in verification):
         return RepairPhase.ERROR
     if any(item.status is RepairOperationStatus.FAILED for item in verification):
         return RepairPhase.VERIFICATION_FAILED
@@ -521,27 +640,57 @@ def _update_diff(session: RepairSession, backend: RepairExecutionBackend) -> Non
     )
 
 
-def _refusal_status(status: str | None) -> RepairOperationStatus:
+def _record_repair_status(
+    operation: RepairOperation,
+    status: RequestStatusResult,
+    initial_tool: str,
+) -> None:
+    if operation.request_id != status.request_id:
+        raise SessionError("ToolHub returned a different approval request ID.")
+    request_not_found = status.outcome is ContractOutcome.REFUSED and (
+        status.error is not None and status.error.code == "REQUEST_NOT_FOUND"
+    )
+    if not request_not_found and status.trace_id != operation.trace_id:
+        raise SessionError("ToolHub lifecycle trace_id changed for the approval request.")
+    if status.approval is not None:
+        expected = expected_resume_tool(initial_tool)
+        if status.approval.resume_tool != expected or operation.resume_tool != expected:
+            raise SessionError(f"ToolHub status returned an unsafe resume_tool for {initial_tool}.")
+        operation.toolhub_status = status.approval.status.value
+        operation.resume_tool = status.approval.resume_tool
+        operation.expires_at = status.approval.expires_at
+    else:
+        operation.toolhub_status = None
+    operation.toolhub_outcome = status.outcome.value
+    operation.error_code = status.error.code if status.error else None
+    operation.error_retryable = status.error.retryable if status.error else None
+    operation.message = _safe_text(status.error.message if status.error else "")
+    operation.status = _operation_status_from_outcome(status.outcome.value)
+    if request_not_found:
+        operation.status = RepairOperationStatus.UNKNOWN
+
+
+def _operation_status_from_outcome(outcome: str | None) -> RepairOperationStatus:
     return {
-        "PENDING": RepairOperationStatus.PENDING,
-        "REJECTED": RepairOperationStatus.REJECTED,
-        "EXPIRED": RepairOperationStatus.EXPIRED,
-        "CONSUMED": RepairOperationStatus.CONSUMED,
-    }.get(status, RepairOperationStatus.UNKNOWN)
+        ContractOutcome.APPROVAL_REQUIRED.value: RepairOperationStatus.PENDING,
+        ContractOutcome.APPROVAL_PENDING.value: RepairOperationStatus.PENDING,
+        ContractOutcome.APPROVAL_APPROVED.value: RepairOperationStatus.PENDING,
+        ContractOutcome.APPROVAL_REJECTED.value: RepairOperationStatus.REJECTED,
+        ContractOutcome.APPROVAL_EXPIRED.value: RepairOperationStatus.EXPIRED,
+        ContractOutcome.APPROVAL_CONSUMED.value: RepairOperationStatus.CONSUMED,
+        ContractOutcome.SUCCEEDED.value: RepairOperationStatus.COMPLETED,
+        ContractOutcome.COMMAND_FAILED.value: RepairOperationStatus.FAILED,
+        ContractOutcome.TIMED_OUT.value: RepairOperationStatus.FAILED,
+        ContractOutcome.CONFLICT.value: RepairOperationStatus.CONFLICT,
+        ContractOutcome.REFUSED.value: RepairOperationStatus.REFUSED,
+        ContractOutcome.FAILED.value: RepairOperationStatus.FAILED,
+    }.get(outcome, RepairOperationStatus.UNKNOWN)
 
 
 def _stored_toolhub_status(status: str | None) -> str | None:
-    if status in {"PENDING", "REJECTED", "EXPIRED", "CONSUMED"}:
+    if status in {"PENDING", "APPROVED", "REJECTED", "EXPIRED", "CONSUMED"}:
         return status
     return None
-
-
-def _result_message(status: str | None, executed: bool, message: str) -> str:
-    safe = _safe_text(message)
-    if not executed and status == "APPROVED":
-        detail = "ToolHub reported APPROVED but did not execute the immutable request."
-        return f"{detail} {safe}".strip()
-    return safe
 
 
 def _patch_refusal_phase(status: RepairOperationStatus) -> RepairPhase:
@@ -551,6 +700,23 @@ def _patch_refusal_phase(status: RepairOperationStatus) -> RepairPhase:
         RepairOperationStatus.EXPIRED: RepairPhase.PATCH_EXPIRED,
         RepairOperationStatus.CONFLICT: RepairPhase.PATCH_CONFLICT,
     }.get(status, RepairPhase.ERROR)
+
+
+def _patch_phase_from_status(status: RepairOperationStatus) -> RepairPhase:
+    if status is RepairOperationStatus.PENDING:
+        return RepairPhase.PATCH_PENDING
+    return _patch_refusal_phase(status)
+
+
+def _require_contract_handle(
+    resume_tool: object,
+    expires_at: object,
+    initial_tool: str,
+) -> None:
+    expected = expected_resume_tool(initial_tool)
+    if resume_tool != expected:
+        raise SessionError(f"Approval handle has an unsafe resume_tool for {initial_tool}.")
+    _timestamp(expires_at, "approval expires_at")
 
 
 def _safe_text(value: object, limit: int = MAX_REPAIR_OUTPUT_CHARS) -> str:
@@ -610,7 +776,12 @@ def _operation_to_data(item: RepairOperation) -> dict[str, Any]:
         "stderr": _safe_text(item.stderr),
         "timed_out": item.timed_out,
         "toolhub_status": item.toolhub_status,
+        "toolhub_outcome": item.toolhub_outcome,
+        "resume_tool": item.resume_tool,
+        "expires_at": item.expires_at,
         "trace_id": item.trace_id,
+        "error_code": item.error_code,
+        "error_retryable": item.error_retryable,
         "message": _safe_text(item.message),
     }
 
@@ -627,6 +798,7 @@ def _diff_to_data(summary: RepairDiffSummary | None) -> dict[str, Any] | None:
 
 
 def _session_from_data(value: object) -> RepairSession:
+    value = _migrate_v1_repair_session(value)
     keys = {
         "schema_version",
         "session_type",
@@ -708,6 +880,38 @@ def _session_from_data(value: object) -> RepairSession:
     return session
 
 
+def _migrate_v1_repair_session(value: object) -> object:
+    """Load schema v1 while making every unresolved approval non-resumable."""
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        return value
+    migrated = deepcopy(value)
+    operations = migrated.get("operations")
+    if not isinstance(operations, list):
+        return migrated
+    unresolved = False
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        if operation.get("status") == RepairOperationStatus.PENDING.value:
+            operation["status"] = RepairOperationStatus.UNKNOWN.value
+            unresolved = True
+        operation.update(
+            {
+                "toolhub_outcome": None,
+                "resume_tool": None,
+                "expires_at": None,
+                "error_code": None,
+                "error_retryable": None,
+            }
+        )
+    if unresolved:
+        migrated["phase"] = RepairPhase.ERROR.value
+        detail = "Schema-v1 approval requests are non-resumable under Contract V1."
+        migrated["error"] = f"{detail} {migrated.get('error', '')}".strip()
+    migrated["schema_version"] = REPAIR_SESSION_SCHEMA_VERSION
+    return migrated
+
+
 def _verification_from_data(value: object, index: int) -> VerificationPlan:
     label = f"verification_plan[{index}]"
     data = _object(value, label, {"name", "command"})
@@ -737,7 +941,12 @@ def _operation_from_data(value: object, index: int) -> RepairOperation:
             "stderr",
             "timed_out",
             "toolhub_status",
+            "toolhub_outcome",
+            "resume_tool",
+            "expires_at",
             "trace_id",
+            "error_code",
+            "error_retryable",
             "message",
         },
     )
@@ -752,6 +961,9 @@ def _operation_from_data(value: object, index: int) -> RepairOperation:
     exit_code = data["exit_code"]
     if exit_code is not None:
         exit_code = _integer(exit_code, f"{label}.exit_code")
+    error_retryable = data["error_retryable"]
+    if error_retryable is not None:
+        error_retryable = _boolean(error_retryable, f"{label}.error_retryable")
     return RepairOperation(
         operation_id=_text(data["operation_id"], f"{label}.operation_id"),
         kind=kind,
@@ -771,7 +983,12 @@ def _operation_from_data(value: object, index: int) -> RepairOperation:
         stderr=_text(data["stderr"], f"{label}.stderr", max_length=MAX_REPAIR_OUTPUT_CHARS),
         timed_out=_boolean(data["timed_out"], f"{label}.timed_out"),
         toolhub_status=_optional_status(data["toolhub_status"], f"{label}.toolhub_status"),
+        toolhub_outcome=_optional_outcome(data["toolhub_outcome"], f"{label}.toolhub_outcome"),
+        resume_tool=_optional_text(data["resume_tool"], f"{label}.resume_tool"),
+        expires_at=_optional_timestamp(data["expires_at"], f"{label}.expires_at"),
         trace_id=_optional_text(data["trace_id"], f"{label}.trace_id"),
+        error_code=_optional_text(data["error_code"], f"{label}.error_code"),
+        error_retryable=error_retryable,
         message=_text(data["message"], f"{label}.message", max_length=MAX_REPAIR_OUTPUT_CHARS),
     )
 
@@ -829,6 +1046,27 @@ def _validate_repair_session(session: RepairSession) -> None:
                 raise SessionError("Verification operation does not match its stored plan.")
         if operation.status is RepairOperationStatus.PENDING and operation.request_id is None:
             raise SessionError("Pending repair operation must have a ToolHub request ID.")
+        if operation.resume_tool is not None:
+            initial_tool = (
+                "filesystem.apply_patch"
+                if operation.kind is RepairOperationKind.PATCH
+                else "shell.run"
+            )
+            if operation.resume_tool != expected_resume_tool(initial_tool):
+                raise SessionError("Repair operation contains an unsafe resume_tool.")
+        if operation.status is RepairOperationStatus.PENDING:
+            if (
+                operation.trace_id is None
+                or operation.expires_at is None
+                or operation.resume_tool is None
+                or operation.toolhub_outcome
+                not in {
+                    ContractOutcome.APPROVAL_REQUIRED.value,
+                    ContractOutcome.APPROVAL_PENDING.value,
+                    ContractOutcome.APPROVAL_APPROVED.value,
+                }
+            ):
+                raise SessionError("Pending repair operation lacks Contract V1 approval metadata.")
         if (
             operation.status
             in {
@@ -842,6 +1080,8 @@ def _validate_repair_session(session: RepairSession) -> None:
     if patch_count > 1:
         raise SessionError("Repair session may contain only one patch operation.")
     patch = session.patch_operation
+    if patch is not None and patch.trace_id != session.patch_trace_id:
+        raise SessionError("Patch operation trace_id does not match the repair lifecycle trace.")
     if session.phase is RepairPhase.DIAGNOSED and session.operations:
         raise SessionError("Diagnosed repair cannot already contain operations.")
     if session.phase is not RepairPhase.DIAGNOSED and patch is None:
@@ -923,6 +1163,37 @@ def _optional_text(value: object, label: str) -> str | None:
     return None if value is None else _text(value, label)
 
 
+def _required_text(value: object, label: str) -> str:
+    text = _text(value, label)
+    if not text:
+        raise SessionError(f"{label} must be non-empty text.")
+    return text
+
+
+def _timestamp(value: object, label: str) -> str:
+    text = _required_text(value, label)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise SessionError(f"{label} must be an ISO-8601 timestamp.") from error
+    if parsed.tzinfo is None:
+        raise SessionError(f"{label} must include a timezone.")
+    return text
+
+
+def _optional_timestamp(value: object, label: str) -> str | None:
+    return None if value is None else _timestamp(value, label)
+
+
+def _optional_outcome(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return ContractOutcome(_text(value, label)).value
+    except ValueError as error:
+        raise SessionError(f"{label} is invalid.") from error
+
+
 def _text_list(value: object, label: str) -> list[str]:
     if not isinstance(value, list) or len(value) > 256:
         raise SessionError(f"{label} must be a bounded list of strings.")
@@ -981,7 +1252,7 @@ def _optional_status(value: object, label: str) -> str | None:
     if value is None:
         return None
     status = _text(value, label)
-    if status not in {"PENDING", "REJECTED", "EXPIRED", "CONSUMED"}:
+    if status not in {"PENDING", "APPROVED", "REJECTED", "EXPIRED", "CONSUMED"}:
         raise SessionError(f"{label} is invalid.")
     return status
 

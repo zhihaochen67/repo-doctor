@@ -21,6 +21,15 @@ from repo_doctor.sessions import (
     session_file_path,
     state_root,
 )
+from repo_doctor.toolhub_contract import (
+    ApprovalHandle,
+    ApprovalStatus,
+    ContractError,
+    ContractOutcome,
+    RequestStatusResult,
+)
+
+EXPIRES_AT = "2099-01-01T00:00:00Z"
 
 
 @pytest.fixture
@@ -40,6 +49,15 @@ def command_result(
     exit_code: int | None = None,
     stdout: str = "",
 ) -> CommandResult:
+    if executed:
+        outcome = "SUCCEEDED" if (exit_code in {None, 0}) else "COMMAND_FAILED"
+    else:
+        outcome = {
+            "PENDING": "APPROVAL_REQUIRED",
+            "REJECTED": "APPROVAL_REJECTED",
+            "EXPIRED": "APPROVAL_EXPIRED",
+            "CONSUMED": "APPROVAL_CONSUMED",
+        }.get(status, "REFUSED")
     return CommandResult(
         name=name,
         command=command,
@@ -52,6 +70,16 @@ def command_result(
         approval_status=status,
         message=f"Request is {status}.",
         executed=executed,
+        trace_id=f"trc_{request_id}",
+        toolhub_outcome=outcome,
+        resume_tool=(
+            "shell.run_approved"
+            if status in {"PENDING", "REJECTED", "EXPIRED", "CONSUMED"}
+            else None
+        ),
+        expires_at=(
+            EXPIRES_AT if status in {"PENDING", "REJECTED", "EXPIRED", "CONSUMED"} else None
+        ),
     )
 
 
@@ -88,8 +116,51 @@ class FakeApprovedBackend:
     def __exit__(self, *exc_info):
         self.closed = True
 
-    def run_approved(self, request_id: str, *, name: str) -> CommandResult:
-        self.calls.append(request_id)
+    def request_status(self, request_id: str) -> RequestStatusResult:
+        self.calls.append(("status", request_id))
+        result = self.responses[request_id]
+        if result.executed:
+            outcome = ContractOutcome.APPROVAL_APPROVED
+            approval_status = ApprovalStatus.APPROVED
+        else:
+            outcome = {
+                "PENDING": ContractOutcome.APPROVAL_PENDING,
+                "REJECTED": ContractOutcome.APPROVAL_REJECTED,
+                "EXPIRED": ContractOutcome.APPROVAL_EXPIRED,
+                "CONSUMED": ContractOutcome.APPROVAL_CONSUMED,
+            }.get(result.approval_status, ContractOutcome.REFUSED)
+            approval_status = {
+                "PENDING": ApprovalStatus.PENDING,
+                "REJECTED": ApprovalStatus.REJECTED,
+                "EXPIRED": ApprovalStatus.EXPIRED,
+                "CONSUMED": ApprovalStatus.CONSUMED,
+            }.get(result.approval_status)
+        approval = (
+            ApprovalHandle(request_id, approval_status, EXPIRES_AT, "shell.run_approved")
+            if approval_status is not None
+            else None
+        )
+        error = None
+        if outcome is ContractOutcome.REFUSED:
+            error = ContractError("REQUEST_NOT_FOUND", result.message, False)
+        elif outcome is not ContractOutcome.APPROVAL_APPROVED:
+            error = ContractError(
+                outcome.value,
+                result.message,
+                outcome is ContractOutcome.APPROVAL_PENDING,
+            )
+        trace_id = f"trc_{request_id}" if outcome is not ContractOutcome.REFUSED else "trc_unknown"
+        return RequestStatusResult(request_id, outcome, trace_id, approval, error)
+
+    def run_approved(
+        self,
+        request_id: str,
+        *,
+        name: str,
+        resume_tool: str | None = None,
+    ) -> CommandResult:
+        self.calls.append(("resume", request_id))
+        assert resume_tool == "shell.run_approved"
         result = self.responses[request_id]
         assert result.name == name
         return result
@@ -140,7 +211,7 @@ def test_session_stores_multiple_requests_and_canonical_target(
     assert [item.verification_kind for item in loaded.operations] == ["tests", "lint"]
     raw = session_file_path(session.session_id).read_text(encoding="utf-8")
     assert '"approved"' not in raw.lower()
-    assert loaded.schema_version == 1
+    assert loaded.schema_version == 2
     assert loaded.session_id == session.session_id
 
 
@@ -166,6 +237,39 @@ def test_session_write_uses_atomic_replace(
     assert destination.is_file()
 
 
+def test_oversized_scan_update_preserves_previous_file_and_leaves_no_temp(
+    tmp_path: Path, state_root_dir: Path
+) -> None:
+    session = pending_session(tmp_path)
+    destination = session_file_path(session.session_id)
+    original = destination.read_bytes()
+    session.result.potential_bugs = ["x" * 20_000 for _ in range(60)]
+
+    with pytest.raises(SessionError, match="exceeds.*safety limit"):
+        save_session(session)
+
+    assert destination.read_bytes() == original
+    assert not list(destination.parent.glob(f".{session.session_id}.*.tmp"))
+
+
+def test_oversized_first_scan_save_leaves_no_file_or_temp(
+    tmp_path: Path, state_root_dir: Path
+) -> None:
+    session = create_scan_session(
+        scan_result(tmp_path, command_result("Python tests", ("pytest",), "req_tests"))
+    )
+    session.result.potential_bugs = ["x" * 20_000 for _ in range(60)]
+    destination = session_file_path(session.session_id)
+
+    with pytest.raises(SessionError, match="exceeds.*safety limit"):
+        save_session(session)
+
+    assert not destination.exists()
+    assert not destination.parent.exists() or not list(
+        destination.parent.glob(f".{session.session_id}.*.tmp")
+    )
+
+
 def test_resume_approved_result_updates_report_and_completes(
     tmp_path: Path, state_root_dir: Path
 ) -> None:
@@ -186,7 +290,7 @@ def test_resume_approved_result_updates_report_and_completes(
     )
 
     loaded = load_session(session.session_id)
-    assert calls == ["req_tests"]
+    assert calls == [("status", "req_tests"), ("resume", "req_tests")]
     assert loaded.status is SessionStatus.COMPLETED
     assert loaded.operations[0].status is OperationStatus.COMPLETED
     assert loaded.result.commands[0].passed
@@ -205,7 +309,7 @@ def test_resume_pending_remains_pending(tmp_path: Path, state_root_dir: Path) ->
         backend_factory=backend_factory({"req_tests": pending}, calls),
     )
 
-    assert calls == ["req_tests"]
+    assert calls == [("status", "req_tests")]
     assert session.status is SessionStatus.PENDING
     assert session.operations[0].status is OperationStatus.PENDING
     assert "APPROVAL REQUIRED" in render_report(session.result)
@@ -224,6 +328,10 @@ def test_resume_unknown_request_is_reported_clearly(tmp_path: Path, state_root_d
         request_id="req_tests",
         message="Unknown approval request: req_tests",
         executed=False,
+        trace_id="trc_req_tests",
+        toolhub_outcome="REFUSED",
+        error_code="REQUEST_NOT_FOUND",
+        error_retryable=False,
     )
 
     resume_scan_session(
@@ -261,6 +369,7 @@ def test_resume_terminal_toolhub_state_is_distinct_from_failure(
         backend_factory=backend_factory({"req_tests": result}, calls),
     )
 
+    assert calls == [("status", "req_tests")]
     assert session.operations[0].status is operation_status
     assert session.status is SessionStatus.UNABLE_TO_CONTINUE
     report = render_report(session.result)
@@ -286,7 +395,11 @@ def test_two_requests_make_partial_progress_and_persist(
     )
 
     loaded = load_session(session.session_id)
-    assert calls == ["req_tests", "req_lint"]
+    assert calls == [
+        ("status", "req_tests"),
+        ("resume", "req_tests"),
+        ("status", "req_lint"),
+    ]
     assert loaded.status is SessionStatus.PARTIAL
     assert [item.status for item in loaded.operations] == [
         OperationStatus.COMPLETED,
@@ -308,7 +421,48 @@ def test_repeated_resume_does_not_reexecute_completed_operation(
     resume_scan_session(session, backend_factory=factory)
     resume_scan_session(session, backend_factory=lambda _: pytest.fail("backend was reopened"))
 
-    assert calls == ["req_tests"]
+    assert calls == [("status", "req_tests"), ("resume", "req_tests")]
+
+
+def test_trace_mismatch_fails_before_approved_tool_call(
+    tmp_path: Path, state_root_dir: Path
+) -> None:
+    session = pending_session(tmp_path)
+    calls = []
+    approved = command_result(
+        "Python tests", ("pytest",), "req_tests", status="CONSUMED", executed=True
+    )
+    backend = FakeApprovedBackend(tmp_path, {"req_tests": approved}, calls)
+    real_status = backend.request_status
+
+    def mismatched(request_id: str) -> RequestStatusResult:
+        status = real_status(request_id)
+        return RequestStatusResult(
+            status.request_id,
+            status.outcome,
+            "trc_different",
+            status.approval,
+            status.error,
+        )
+
+    backend.request_status = mismatched
+
+    with pytest.raises(SessionError, match="trace_id changed"):
+        resume_scan_session(session, backend_factory=lambda _root: backend)
+
+    assert calls == [("status", "req_tests")]
+
+
+def test_session_cannot_inject_arbitrary_resume_tool(tmp_path: Path, state_root_dir: Path) -> None:
+    session = pending_session(tmp_path)
+    path = session_file_path(session.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["operations"][0]["resume_tool"] = "attacker.execute"
+    payload["scan"]["commands"][0]["resume_tool"] = "attacker.execute"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SessionError, match="unsafe resume_tool|must be 'shell.run_approved'"):
+        load_session(session.session_id)
 
 
 def test_malformed_session_has_clear_error(tmp_path: Path, state_root_dir: Path) -> None:
@@ -319,6 +473,95 @@ def test_malformed_session_has_clear_error(tmp_path: Path, state_root_dir: Path)
 
     with pytest.raises(SessionError, match="missing or unexpected fields"):
         load_session_file(path, expected_id=session_id)
+
+
+def test_schema_v1_pending_session_migrates_without_approval_authority(
+    tmp_path: Path, state_root_dir: Path
+) -> None:
+    session = pending_session(tmp_path)
+    path = session_file_path(session.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    for operation in payload["operations"]:
+        for field in ("toolhub_outcome", "resume_tool", "expires_at", "trace_id"):
+            operation.pop(field)
+    for command in payload["scan"]["commands"]:
+        for field in (
+            "toolhub_outcome",
+            "resume_tool",
+            "expires_at",
+            "trace_id",
+            "error_code",
+            "error_retryable",
+        ):
+            command.pop(field)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    migrated = load_session(session.session_id)
+
+    assert migrated.schema_version == 2
+    assert migrated.operations[0].status is OperationStatus.UNKNOWN
+    assert not migrated.pending_operations
+    assert migrated.status is SessionStatus.UNABLE_TO_CONTINUE
+    assert migrated.operations[0].resume_tool is None
+    assert migrated.operations[0].toolhub_outcome is None
+    assert migrated.result.commands[0].approval_status is None
+    assert migrated.result.commands[0].resume_tool is None
+
+
+def test_terminal_schema_v1_scan_session_remains_readable(
+    tmp_path: Path, state_root_dir: Path
+) -> None:
+    session = pending_session(tmp_path)
+    path = session_file_path(session.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload["status"] = "completed"
+    payload["operations"][0]["status"] = "completed"
+    command = payload["scan"]["commands"][0]
+    command.update(
+        {
+            "executed": True,
+            "approval_required": False,
+            "exit_code": 0,
+            "toolhub_approval_status": "CONSUMED",
+        }
+    )
+    for operation in payload["operations"]:
+        for field in ("toolhub_outcome", "resume_tool", "expires_at", "trace_id"):
+            operation.pop(field)
+    for item in payload["scan"]["commands"]:
+        for field in (
+            "toolhub_outcome",
+            "resume_tool",
+            "expires_at",
+            "trace_id",
+            "error_code",
+            "error_retryable",
+        ):
+            item.pop(field)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    migrated = load_session(session.session_id)
+
+    assert migrated.schema_version == 2
+    assert migrated.status is SessionStatus.COMPLETED
+    assert migrated.operations[0].status is OperationStatus.COMPLETED
+    assert migrated.operations[0].resume_tool is None
+    assert migrated.result.commands[0].executed is True
+    assert migrated.result.commands[0].approval_status == "CONSUMED"
+    assert not migrated.pending_operations
+
+
+def test_future_session_schema_fails_closed(tmp_path: Path, state_root_dir: Path) -> None:
+    session = pending_session(tmp_path)
+    path = session_file_path(session.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 999
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SessionError, match="Unsupported session schema version 999"):
+        load_session(session.session_id)
 
 
 def test_resume_uses_only_stored_target_path(

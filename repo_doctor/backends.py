@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import queue
 import subprocess
@@ -26,9 +25,38 @@ from .models import (
 )
 from .runner import run_command as run_local_command
 from .security import verification_environment
+from .toolhub_contract import (
+    CAPABILITIES_TOOL,
+    REQUEST_STATUS_TOOL,
+    ContractOutcome,
+    ContractResponse,
+    ContractValidationError,
+    RequestStatusResult,
+    ToolHubCapabilities,
+    expected_resume_tool,
+    parse_capabilities,
+    parse_contract_response,
+    parse_request_status,
+)
 
-DEFAULT_TOOLHUB_PROJECT = Path(r"D:\mcp-toolhub")
+TOOLHUB_PROJECT_ENV = "REPO_DOCTOR_TOOLHUB_PROJECT"
+DEFAULT_WINDOWS_TOOLHUB_PROJECT = Path(r"D:\mcp-toolhub")
 MCP_CLEANUP_TIMEOUT_SECONDS = 10.0
+_PYTHON_BOOTSTRAP_ENVIRONMENT = {
+    "PYTHONBREAKPOINT",
+    "PYTHONCASEOK",
+    "PYTHONEXECUTABLE",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONNOUSERSITE",
+    "PYTHONPATH",
+    "PYTHONPLATLIBDIR",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONSAFEPATH",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+    "PYTHONWARNINGS",
+}
 
 
 class ToolBackendError(Exception):
@@ -49,6 +77,17 @@ class FileReadError(ToolCallError):
 
 class MutationConflictError(ToolCallError):
     """ToolHub refused a mutation because its optimistic hash was stale."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trace_id: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.trace_id = trace_id
+        self.error_code = error_code
 
 
 class ToolBackendKind(StrEnum):
@@ -327,14 +366,12 @@ def _tool_payload(result: Any) -> dict[str, Any]:
     structured = getattr(result, "structured_content", None)
     if isinstance(structured, dict):
         return structured
-    text = _tool_text(result)
-    try:
-        decoded = json.loads(text)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError("ToolHub returned neither structured output nor JSON text.") from error
-    if not isinstance(decoded, dict):
-        raise RuntimeError("ToolHub returned a non-object tool result.")
-    return decoded
+    detail = _tool_text(result)
+    suffix = f" Diagnostic text: {detail[:500]}" if detail else ""
+    raise RuntimeError(
+        "ToolHub returned no structuredContent object; Contract V1 does not permit "
+        f"JSON-text lifecycle fallback.{suffix}"
+    )
 
 
 def _tool_text(result: Any) -> str:
@@ -345,20 +382,71 @@ def _tool_text(result: Any) -> str:
     )
 
 
-def _toolhub_process(root: Path, toolhub_project: Path) -> MCPServerProcess:
-    project = toolhub_project.expanduser().resolve()
-    if os.name == "nt":
-        bundled = project / ".venv" / "Scripts" / "mcp.exe"
+def _configured_toolhub_project(toolhub_project: Path | None) -> Path:
+    """Resolve one explicit ToolHub checkout without global discovery."""
+    if toolhub_project is not None:
+        candidate = Path(toolhub_project)
+        source = "Configured ToolHub project"
+    elif TOOLHUB_PROJECT_ENV in os.environ:
+        candidate = Path(os.environ[TOOLHUB_PROJECT_ENV])
+        source = TOOLHUB_PROJECT_ENV
+    elif os.name == "nt" and DEFAULT_WINDOWS_TOOLHUB_PROJECT.is_dir():
+        candidate = DEFAULT_WINDOWS_TOOLHUB_PROJECT
+        source = "Windows ToolHub default"
     else:
-        bundled = project / ".venv" / "bin" / "mcp"
-    command = str(bundled) if bundled.is_file() else "mcp"
+        raise ToolBackendStartupError(
+            f"ToolHub project is not configured. Set {TOOLHUB_PROJECT_ENV} to the absolute "
+            "path of a production ToolHub checkout containing a project-local .venv."
+        )
+    if not candidate.is_absolute():
+        raise ToolBackendStartupError(f"{source} must be an absolute path, got {str(candidate)!r}.")
+    try:
+        project = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ToolBackendStartupError(
+            f"{source} does not exist: {candidate}. Set {TOOLHUB_PROJECT_ENV} to a valid "
+            "production ToolHub checkout."
+        ) from error
+    if not project.is_dir():
+        raise ToolBackendStartupError(f"{source} is not a directory: {project}")
+    return project
+
+
+def _toolhub_environment(root: Path) -> dict[str, str]:
+    """Build a credential-safe environment without Python import-path injection."""
     environment = verification_environment()
+    for name in list(environment):
+        if name.upper() in _PYTHON_BOOTSTRAP_ENVIRONMENT:
+            environment.pop(name)
     environment["TOOLHUB_WORKSPACE_ROOT"] = str(root)
+    return environment
+
+
+def _toolhub_process(
+    root: Path,
+    toolhub_project: Path | None = None,
+    *,
+    platform_name: str | None = None,
+) -> MCPServerProcess:
+    project = _configured_toolhub_project(toolhub_project)
+    workspace = _canonical_repository(root)
+    platform = platform_name or os.name
+
+    if platform == "nt":
+        bundled_python = project / ".venv" / "Scripts" / "python.exe"
+    else:
+        bundled_python = project / ".venv" / "bin" / "python"
+    if not bundled_python.is_file():
+        raise ToolBackendStartupError(
+            f"Configured ToolHub checkout has no project-local Python interpreter at "
+            f"{bundled_python}. Create the checkout's .venv or set {TOOLHUB_PROJECT_ENV} "
+            "to a prepared production checkout; Repo Doctor will not use PATH/global fallbacks."
+        )
     return MCPServerProcess(
-        command=command,
-        args=("run", "server.py:mcp", "--transport", "stdio"),
+        command=str(bundled_python),
+        args=("-m", "mcp_toolhub", "serve"),
         cwd=project,
-        env=environment,
+        env=_toolhub_environment(workspace),
     )
 
 
@@ -371,13 +459,14 @@ class MCPToolBackend:
         self,
         root: Path,
         *,
-        toolhub_project: Path = DEFAULT_TOOLHUB_PROJECT,
+        toolhub_project: Path | None = None,
         client_factory: Callable[[MCPServerProcess], MCPClient] = _StdioMCPClient,
     ):
         self.root = _canonical_repository(root)
         self.server_process = _toolhub_process(self.root, toolhub_project)
         self._client = client_factory(self.server_process)
         self._started = False
+        self.capabilities: ToolHubCapabilities | None = None
 
     def __enter__(self) -> Self:
         self._start()
@@ -391,12 +480,18 @@ class MCPToolBackend:
             return
         try:
             self._client.start()
+            payload = self._client.call_tool(CAPABILITIES_TOOL, {})
+            self.capabilities = parse_capabilities(payload)
         except Exception as error:
             try:
                 self._client.close()
             except Exception:
                 pass
-            raise ToolBackendStartupError(f"Could not start MCP ToolHub: {error}") from error
+            raise ToolBackendStartupError(
+                "Could not start MCP ToolHub with a compatible Contract V1 backend: "
+                f"{error}. Verify the production 'mcp-toolhub serve' environment and "
+                "toolhub.capabilities response."
+            ) from error
         self._started = True
 
     def close(self) -> None:
@@ -406,6 +501,7 @@ class MCPToolBackend:
             raise ToolBackendError(f"Could not cleanly stop MCP ToolHub: {error}") from error
         finally:
             self._started = False
+            self.capabilities = None
 
     def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._start()
@@ -415,6 +511,56 @@ class MCPToolBackend:
             raise
         except Exception as error:
             raise ToolCallError(f"ToolHub call {name} failed: {error}") from error
+
+    def _contract_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        initial_tool: str | None = None,
+    ) -> ContractResponse:
+        payload = self._call(name, arguments)
+        try:
+            response = parse_contract_response(payload, call=name)
+            if response.approval is not None:
+                capabilities = self.capabilities
+                if capabilities is None:
+                    raise ContractValidationError("ToolHub capabilities were not negotiated.")
+                if initial_tool is None:
+                    if response.approval.resume_tool not in capabilities.allowed_resume_tools:
+                        raise ContractValidationError(
+                            "ToolHub returned an approval handle with an undeclared resume_tool."
+                        )
+                else:
+                    expected = capabilities.resume_tool_for(initial_tool)
+                    if response.approval.resume_tool != expected:
+                        raise ContractValidationError(
+                            f"Unsafe resume_tool for {initial_tool}: expected {expected!r}, "
+                            f"got {response.approval.resume_tool!r}."
+                        )
+        except ContractValidationError as error:
+            raise ToolCallError(f"ToolHub call {name} violated Contract V1: {error}") from error
+        return response
+
+    def request_status(self, request_id: str) -> RequestStatusResult:
+        """Return fresh server-owned approval state without granting local authority."""
+        request_id = _approval_request_id(request_id)
+        payload = self._call(REQUEST_STATUS_TOOL, {"request_id": request_id})
+        try:
+            status = parse_request_status(payload, request_id=request_id)
+            if status.approval is not None:
+                capabilities = self.capabilities
+                if capabilities is None:
+                    raise ContractValidationError("ToolHub capabilities were not negotiated.")
+                if status.approval.resume_tool not in capabilities.allowed_resume_tools:
+                    raise ContractValidationError(
+                        "ToolHub status returned an undeclared resume_tool."
+                    )
+        except ContractValidationError as error:
+            raise ToolCallError(
+                f"ToolHub call {REQUEST_STATUS_TOOL} violated Contract V1: {error}"
+            ) from error
+        return status
 
     def read_file(self, path: str) -> FileReadResult:
         relative = _relative_path(path)
@@ -453,7 +599,7 @@ class MCPToolBackend:
             raise ToolCallError("Backend command cannot be empty.")
         relative_cwd = _relative_path(cwd, label="working directory")
         started = time.monotonic()
-        payload = self._call(
+        response = self._contract_call(
             "shell.run",
             {
                 "program": command[0],
@@ -461,17 +607,28 @@ class MCPToolBackend:
                 "cwd": relative_cwd,
                 "timeout_seconds": timeout,
             },
+            initial_tool="shell.run",
         )
-        return _shell_command_result(payload, name, command, started)
+        return _shell_command_result(response, name, command, started)
 
-    def run_approved(self, request_id: str, *, name: str = "Verification") -> CommandResult:
+    def run_approved(
+        self,
+        request_id: str,
+        *,
+        name: str = "Verification",
+        resume_tool: str | None = None,
+    ) -> CommandResult:
         """Ask ToolHub to execute one already-approved, immutable shell request."""
-        if not request_id or "\x00" in request_id:
-            raise ToolCallError("ToolHub approval request ID must be non-empty.")
+        request_id = _approval_request_id(request_id)
+        approved_tool = self._validated_resume_tool("shell.run", resume_tool)
         started = time.monotonic()
-        payload = self._call("shell.run_approved", {"request_id": request_id})
+        response = self._contract_call(
+            approved_tool,
+            {"request_id": request_id},
+            initial_tool="shell.run",
+        )
         return _shell_command_result(
-            payload,
+            response,
             name,
             (),
             started,
@@ -489,38 +646,56 @@ class MCPToolBackend:
         _sha256(expected_hash)
         if not patch or "\x00" in patch:
             raise ToolCallError("Backend patch must be non-empty text without null bytes.")
-        try:
-            payload = self._call(
-                "filesystem.apply_patch",
-                {
-                    "path": relative,
-                    "patch": patch,
-                    "expected_hash": expected_hash,
-                },
-            )
-        except ToolCallError as error:
-            if "conflict:" in str(error).casefold():
-                raise MutationConflictError(str(error)) from error
-            raise
-        return _patch_mutation_result(payload, fallback_path=relative)
-
-    def run_approved_mutation(self, request_id: str) -> PatchMutationResult:
-        """Execute only the immutable mutation snapshot stored by ToolHub."""
-        _approval_request_id(request_id)
-        try:
-            payload = self._call(
-                "filesystem.apply_patch_approved",
-                {"request_id": request_id},
-            )
-        except ToolCallError as error:
-            if "conflict:" in str(error).casefold():
-                raise MutationConflictError(str(error)) from error
-            raise
-        return _patch_mutation_result(
-            payload,
-            fallback_path="",
-            fallback_request_id=request_id,
+        response = self._contract_call(
+            "filesystem.apply_patch",
+            {
+                "path": relative,
+                "patch": patch,
+                "expected_hash": expected_hash,
+            },
+            initial_tool="filesystem.apply_patch",
         )
+        return _patch_mutation_result(response, fallback_path=relative)
+
+    def run_approved_mutation(
+        self,
+        request_id: str,
+        *,
+        resume_tool: str | None = None,
+        expected_path: str,
+        expected_trace_id: str,
+    ) -> PatchMutationResult:
+        """Execute only the immutable mutation snapshot stored by ToolHub."""
+        request_id = _approval_request_id(request_id)
+        expected_path = _relative_path(expected_path)
+        expected_trace_id = _lifecycle_trace_id(expected_trace_id)
+        approved_tool = self._validated_resume_tool("filesystem.apply_patch", resume_tool)
+        response = self._contract_call(
+            approved_tool,
+            {"request_id": request_id},
+            initial_tool="filesystem.apply_patch",
+        )
+        return _patch_mutation_result(
+            response,
+            fallback_path=expected_path,
+            fallback_request_id=request_id,
+            expected_trace_id=expected_trace_id,
+        )
+
+    def _validated_resume_tool(self, initial_tool: str, declared: str | None) -> str:
+        capabilities = self.capabilities
+        if capabilities is None:
+            self._start()
+            capabilities = self.capabilities
+        if capabilities is None:  # pragma: no cover - defensive after successful startup
+            raise ToolCallError("ToolHub capabilities were not negotiated.")
+        expected = expected_resume_tool(initial_tool)
+        negotiated = capabilities.resume_tool_for(initial_tool)
+        if negotiated != expected:
+            raise ToolCallError(f"Unsafe negotiated resume tool for {initial_tool}.")
+        if declared is not None and declared != expected:
+            raise ToolCallError(f"Refusing unexpected resume_tool {declared!r} for {initial_tool}.")
+        return negotiated
 
     def git_status(self) -> GitStatusResult:
         payload = self._call("git.status", {})
@@ -556,7 +731,7 @@ class MCPToolBackend:
 
 
 def _shell_command_result(
-    payload: dict[str, Any],
+    response: ContractResponse,
     name: str,
     fallback_command: tuple[str, ...],
     started: float,
@@ -565,12 +740,24 @@ def _shell_command_result(
 ) -> CommandResult:
     """Validate and map a ToolHub shell response into Repo Doctor's model."""
     try:
+        payload = response.payload
+        if response.outcome is ContractOutcome.CONFLICT:
+            raise TypeError("shell.run cannot return CONFLICT")
         executed = payload["executed"]
         if not isinstance(executed, bool):
             raise TypeError("executed must be a boolean")
-        timed_out = payload.get("timed_out", False)
+        should_execute = response.outcome in {
+            ContractOutcome.SUCCEEDED,
+            ContractOutcome.COMMAND_FAILED,
+            ContractOutcome.TIMED_OUT,
+        }
+        if executed is not should_execute:
+            raise TypeError("executed contradicts outcome")
+        timed_out = payload["timed_out"]
         if not isinstance(timed_out, bool):
             raise TypeError("timed_out must be a boolean")
+        if timed_out is not (response.outcome is ContractOutcome.TIMED_OUT):
+            raise TypeError("timed_out contradicts outcome")
         program = payload.get("program", "")
         arguments = payload.get("args", [])
         if (
@@ -582,21 +769,25 @@ def _shell_command_result(
         command = (program, *arguments) if program else fallback_command
         if executed:
             returncode = payload.get("returncode")
-            if returncode is None and timed_out:
+            if returncode is None and response.outcome is ContractOutcome.TIMED_OUT:
                 exit_code = 124
             else:
                 exit_code = int(returncode)
+            if response.outcome is ContractOutcome.SUCCEEDED and exit_code != 0:
+                raise TypeError("SUCCEEDED must have returncode 0")
+            if response.outcome is ContractOutcome.COMMAND_FAILED and exit_code == 0:
+                raise TypeError("COMMAND_FAILED must have a nonzero returncode")
         else:
+            if payload.get("returncode") is not None:
+                raise TypeError("non-executed shell result cannot have a returncode")
             exit_code = 126
-        approval_status = payload.get("approval_status")
-        if approval_status is not None and not isinstance(approval_status, str):
-            raise TypeError("approval_status must be text or null")
-        request_id = payload.get("request_id", fallback_request_id)
-        if request_id is not None and not isinstance(request_id, str):
-            raise TypeError("request_id must be text or null")
-        trace_id = payload.get("trace_id")
-        if trace_id is not None and not isinstance(trace_id, str):
-            raise TypeError("trace_id must be text or null")
+        request_id, approval_status, expires_at, resume_tool = _response_approval_metadata(
+            response,
+            fallback_request_id=fallback_request_id,
+        )
+        error_code = response.error.code if response.error else None
+        error_retryable = response.error.retryable if response.error else None
+        diagnostic = response.message or (response.error.message if response.error else "")
         return CommandResult(
             name=name,
             command=command,
@@ -605,15 +796,49 @@ def _shell_command_result(
             stderr=str(payload.get("stderr", "")),
             duration=time.monotonic() - started,
             timed_out=timed_out,
-            approval_required=not executed and approval_status == "PENDING",
-            request_id=request_id or fallback_request_id,
+            approval_required=response.outcome is ContractOutcome.APPROVAL_REQUIRED,
+            request_id=request_id,
             approval_status=approval_status,
-            message=str(payload.get("message", "")),
+            message=diagnostic,
             executed=executed,
-            trace_id=trace_id,
+            trace_id=response.trace_id,
+            toolhub_outcome=response.outcome.value,
+            resume_tool=resume_tool,
+            expires_at=expires_at,
+            error_code=error_code,
+            error_retryable=error_retryable,
         )
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError, ContractValidationError) as error:
         raise ToolCallError("ToolHub returned an invalid shell result.") from error
+
+
+def _response_approval_metadata(
+    response: ContractResponse,
+    *,
+    fallback_request_id: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    approval = response.approval
+    request_id = approval.request_id if approval else fallback_request_id
+    approval_status = approval.status.value if approval else None
+    expires_at = approval.expires_at if approval else None
+    resume_tool = approval.resume_tool if approval else None
+
+    payload_request_id = response.payload.get("request_id")
+    if payload_request_id is not None:
+        payload_request_id = _approval_request_id(payload_request_id)
+        if request_id is not None and payload_request_id != request_id:
+            raise ContractValidationError("Top-level request_id contradicts the approval handle.")
+        request_id = payload_request_id
+    if fallback_request_id is not None and request_id != fallback_request_id:
+        raise ContractValidationError("ToolHub returned a different approval request ID.")
+
+    payload_status = response.payload.get("approval_status")
+    if payload_status is not None:
+        if not isinstance(payload_status, str) or payload_status != approval_status:
+            raise ContractValidationError(
+                "Top-level approval_status contradicts the approval handle."
+            )
+    return request_id, approval_status, expires_at, resume_tool
 
 
 def _approval_request_id(request_id: str) -> str:
@@ -627,6 +852,17 @@ def _approval_request_id(request_id: str) -> str:
     return request_id
 
 
+def _lifecycle_trace_id(trace_id: str) -> str:
+    if (
+        not isinstance(trace_id, str)
+        or not trace_id
+        or len(trace_id) > 512
+        or any(ord(character) < 32 for character in trace_id)
+    ):
+        raise ToolCallError("ToolHub lifecycle trace ID must be non-empty bounded text.")
+    return trace_id
+
+
 def _sha256(value: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ToolCallError("Expected hash must be a lowercase SHA-256 digest.")
@@ -634,37 +870,60 @@ def _sha256(value: str) -> str:
 
 
 def _patch_mutation_result(
-    payload: dict[str, Any],
+    response: ContractResponse,
     *,
     fallback_path: str,
     fallback_request_id: str | None = None,
+    expected_trace_id: str | None = None,
 ) -> PatchMutationResult:
     """Validate and map a ToolHub filesystem mutation response."""
     try:
+        payload = response.payload
+        if response.outcome in {ContractOutcome.COMMAND_FAILED, ContractOutcome.TIMED_OUT}:
+            raise TypeError("filesystem.apply_patch returned a shell-only outcome")
         executed = payload["executed"]
         if not isinstance(executed, bool):
             raise TypeError("executed must be a boolean")
+        if executed is not (response.outcome is ContractOutcome.SUCCEEDED):
+            raise TypeError("executed contradicts outcome")
         changed = payload.get("changed", False)
         if not isinstance(changed, bool):
             raise TypeError("changed must be a boolean")
-        path = payload.get("path", fallback_path)
+        path = payload["path"]
         if not isinstance(path, str):
             raise TypeError("path must be text")
-        request_id = payload.get("request_id", fallback_request_id)
-        if request_id is not None and not isinstance(request_id, str):
-            raise TypeError("request_id must be text or null")
-        approval_status = payload.get("approval_status")
-        if approval_status is not None and not isinstance(approval_status, str):
-            raise TypeError("approval_status must be text or null")
-        trace_id = payload.get("trace_id")
-        if trace_id is not None and not isinstance(trace_id, str):
-            raise TypeError("trace_id must be text or null")
+        if fallback_path and path != fallback_path:
+            raise TypeError("path contradicts submitted patch target")
+        request_id, approval_status, expires_at, resume_tool = _response_approval_metadata(
+            response,
+            fallback_request_id=fallback_request_id,
+        )
+        if expected_trace_id is not None and response.trace_id != expected_trace_id:
+            raise ContractValidationError(
+                "ToolHub patch result returned a different lifecycle trace_id."
+            )
         previous_hash = payload.get("previous_hash")
         new_hash = payload.get("new_hash")
         if previous_hash is not None:
             _sha256(str(previous_hash))
         if new_hash is not None:
             _sha256(str(new_hash))
+        if not executed and changed:
+            raise TypeError("non-executed patch result cannot report changed=true")
+        if response.outcome is ContractOutcome.CONFLICT:
+            if (
+                response.error is None
+                or response.error.retryable
+                or response.error.code not in {"MUTATION_CONFLICT", "EXPECTED_HASH_MISMATCH"}
+            ):
+                raise ContractValidationError(
+                    "CONFLICT requires a non-retryable structured mutation-conflict error."
+                )
+            raise MutationConflictError(
+                response.error.message,
+                trace_id=response.trace_id,
+                error_code=response.error.code,
+            )
         return PatchMutationResult(
             path=path or fallback_path,
             executed=executed,
@@ -675,12 +934,19 @@ def _patch_mutation_result(
             bytes_after=int(payload.get("bytes_after", 0)),
             previous_hash=str(previous_hash) if previous_hash is not None else None,
             new_hash=str(new_hash) if new_hash is not None else None,
-            trace_id=trace_id,
-            request_id=request_id or fallback_request_id,
+            trace_id=response.trace_id,
+            request_id=request_id,
             approval_status=approval_status,
-            message=str(payload.get("message", "")),
+            message=response.message or (response.error.message if response.error else ""),
+            toolhub_outcome=response.outcome.value,
+            resume_tool=resume_tool,
+            expires_at=expires_at,
+            error_code=response.error.code if response.error else None,
+            error_retryable=response.error.retryable if response.error else None,
         )
-    except (KeyError, TypeError, ValueError) as error:
+    except MutationConflictError:
+        raise
+    except (KeyError, TypeError, ValueError, ContractValidationError) as error:
         raise ToolCallError("ToolHub returned an invalid filesystem patch result.") from error
 
 

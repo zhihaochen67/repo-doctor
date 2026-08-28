@@ -113,7 +113,7 @@ def execute_mcp_ai_fix(
                 target.sha256,
             )
         except MutationConflictError as error:
-            record_patch_conflict(session, str(error))
+            record_patch_conflict(session, error)
             save_repair_session(session)
             return MCPFixOutcome(RepairPhase.PATCH_CONFLICT.value, session, preview)
         record_patch_request(session, mutation)

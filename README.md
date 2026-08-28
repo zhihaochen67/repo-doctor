@@ -3,7 +3,7 @@
 [![CI](https://github.com/asxvgxkep/repo-doctor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asxvgxkep/repo-doctor/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 ![Release v0.3.0](https://img.shields.io/badge/release-v0.3.0-2563eb)
-![Tests: 153 passed, 4 skipped](https://img.shields.io/badge/tests-153%20passed%2C%204%20skipped-16a34a)
+![Tests: 227 passed, 5 skipped](https://img.shields.io/badge/tests-227%20passed%2C%205%20skipped-16a34a)
 
 **Repository diagnostics, optional LLM semantic analysis, and safely verified repair from one
 local-first CLI.**
@@ -33,23 +33,70 @@ Local execution remains the default and requires no ToolHub process:
 repo-doctor scan . --tool-backend local
 ```
 
-An MCP backend is available for scans when MCP ToolHub is installed at `D:\mcp-toolhub`:
+An MCP backend is available for scans and AI repair when a production MCP ToolHub checkout is
+explicitly configured with an absolute path:
+
+```powershell
+$env:REPO_DOCTOR_TOOLHUB_PROJECT = "D:\mcp-toolhub"
+```
+
+```sh
+export REPO_DOCTOR_TOOLHUB_PROJECT=/opt/mcp-toolhub
+```
+
+The configured path must resolve to an existing directory. On Windows only, `D:\mcp-toolhub` is
+used as a compatibility default when that directory actually exists. POSIX systems and Windows
+systems without that directory fail closed with a configuration error.
 
 ```console
 repo-doctor scan D:\target-repository --tool-backend mcp
 repo-doctor fix D:\target-repository --ai --tool-backend mcp
 ```
 
-Repo Doctor starts ToolHub over stdio and explicitly sets `TOOLHUB_WORKSPACE_ROOT` to the canonical
-absolute target repository. The workspace is fixed for that session and cannot be replaced by an
-individual tool call. Repository-defined test and lint commands that ToolHub classifies as requiring
-approval are reported with their request ID; Repo Doctor never approves or silently executes them.
-The trusted administrator command remains:
+Repo Doctor launches ToolHub's production stdio entry point, never the development `mcp run`
+bootstrap. The exact checkout-bound launch is:
+
+```text
+Windows: <toolhub>\.venv\Scripts\python.exe -m mcp_toolhub serve
+POSIX:   <toolhub>/.venv/bin/python -m mcp_toolhub serve
+```
+
+If that project-local interpreter is absent, startup fails. Repo Doctor never searches `PATH`,
+never executes a global `mcp-toolhub`, and never uses Repo Doctor's own Python interpreter to import
+`mcp_toolhub`. The subprocess has the canonical checkout as its fixed working directory and
+`TOOLHUB_WORKSPACE_ROOT` set to the canonical target repository. Its environment removes
+`PYTHONPATH`, `PYTHONHOME`, and other Python startup/module-redirection variables while preserving
+an explicitly supplied `TOOLHUB_STATE_ROOT`. Transport is stdio only and ToolHub keeps stdout
+protocol-only.
+
+Immediately after MCP initialization, Repo Doctor calls `toolhub.capabilities` and parses only its
+`structuredContent`. This adapter requires Contract major version 1, transport `stdio`, the
+human-only/out-of-band/atomic/single-use/expiring approval model, and these exact mappings:
+
+```text
+shell.run                 -> shell.run_approved
+filesystem.apply_patch    -> filesystem.apply_patch_approved
+```
+
+Compatible Contract `1.x` minor versions are accepted when all required fields and mappings remain
+valid. ToolHub's package version is independent of its contract version and is not compared with
+Repo Doctor's package version. Missing or malformed capabilities, another contract major, or an
+unsafe resume mapping fails backend startup; there is no legacy downgrade.
+
+Repository-defined commands and mutations can return `APPROVAL_REQUIRED`. Repo Doctor persists the
+server's request ID, expiry, declared resume tool, latest structured outcome/status, and lifecycle
+trace ID. It never parses human-readable messages or JSON text to decide what happens next.
+Approval is always an out-of-band human action. Use the trusted configured checkout's admin
+executable for the decision:
 
 ```powershell
-cd D:\mcp-toolhub
-uv run python -m toolhub.admin approve <request_id>
+& "$env:REPO_DOCTOR_TOOLHUB_PROJECT\.venv\Scripts\mcp-toolhub-admin.exe" list
+& "$env:REPO_DOCTOR_TOOLHUB_PROJECT\.venv\Scripts\mcp-toolhub-admin.exe" approve REQUEST_ID
+& "$env:REPO_DOCTOR_TOOLHUB_PROJECT\.venv\Scripts\mcp-toolhub-admin.exe" reject REQUEST_ID
 ```
+
+On POSIX, use `$REPO_DOCTOR_TOOLHUB_PROJECT/.venv/bin/mcp-toolhub-admin` with the same subcommands.
+**Repo Doctor never approves or rejects its own requests and provides no approval command.**
 
 When approvals are pending, Repo Doctor atomically stores a versioned orchestration session under
 its user-level state directory and prints its session ID; the target repository is never modified
@@ -62,29 +109,48 @@ out-of-band, resume from anywhere:
 repo-doctor resume <session-id>
 ```
 
-Resume binds ToolHub to the canonical target path saved in the session and passes only each original
-request ID to `shell.run_approved`. Approved requests execute and become consumed; pending requests
-remain resumable, while rejected, expired, already-consumed, and unknown requests are reported as
-distinct non-execution states rather than test failures. Each completed operation is saved before
-the next request, so a later resume neither waits for every approval nor replays completed work.
-Session files contain report context and ToolHub-returned states, but no local approval flag or
-self-approval mechanism. ToolHub remains authoritative for approval and replay protection.
+Resume binds ToolHub to the canonical target path saved in the session. For every unresolved
+request it first calls `toolhub.request_status`. Only an explicit structured
+`APPROVAL_APPROVED` result may proceed. Repo Doctor then verifies that the fresh server-declared
+`resume_tool` matches both the negotiated mapping and the operation kind, and invokes it with the
+request ID only. `APPROVAL_PENDING` remains resumable; rejected and expired requests become terminal;
+unknown or unavailable requests are never recreated; and a consumed request that is not already
+locally completed is surfaced as a non-execution/reconciliation error rather than guessed as
+success. One approved verification can progress while other requests remain pending, and every
+completed operation is atomically saved before the next.
+
+The ToolHub trace ID returned at submission is retained across status and approved execution. A
+different trace for the same request is a contract-correlation failure; Repo Doctor never replaces
+the stored trace and never substitutes its own session ID. Session schema v2 stores bounded report
+context and approval-handle metadata, but no patch body, protected ToolHub snapshot, local
+`approved=true` flag, or self-approval mechanism. Schema-v1 pending requests can be read for display
+but are migrated to non-resumable state because old files cannot confer Contract V1 authority.
 
 For an MCP AI repair, Repo Doctor diagnoses the issue, rereads the selected target through
 `filesystem.read_file`, validates the proposal against those exact bytes, and submits a unified
 patch through `filesystem.apply_patch`. Every existing-file repair includes ToolHub's returned
 SHA-256 as `expected_hash`; a stale hash is a terminal `PATCH_CONFLICT` and never triggers a forced
-write. The pending repair session stores request IDs, the fixed canonical workspace, hashes,
-finding metadata, bounded results, and trace IDs, but not the patch body or a local approval flag.
+write or automatic resubmission. Conflict behavior is driven by structured `CONFLICT` outcome/error
+metadata, never by matching message text.
 
-After out-of-band approval, the same `repo-doctor resume <session-id>` command calls only
-`filesystem.apply_patch_approved(request_id)`. Once ToolHub applies and consumes the immutable
-request, Repo Doctor submits the discovered verification commands through `shell.run`. Any pending
-test or lint approvals are appended to that same repair session. Completed verification is followed
-by ToolHub `git.diff`, whose bounded summary remains available for operator review and audit
-correlation.
+The complete lifecycle is:
 
-MCP repair v1 deliberately does not perform a hidden local rollback. If ToolHub has applied the
+```text
+Repo Doctor -> production ToolHub stdio -> toolhub.capabilities
+            -> submit operation -> APPROVAL_REQUIRED -> persist handle
+human admin -> approve/reject out of band
+Repo Doctor -> resume -> toolhub.request_status -> APPROVAL_APPROVED
+            -> validated server resume_tool(request_id) -> correlated final outcome
+```
+
+For shell execution, `SUCCEEDED`, `COMMAND_FAILED`, `TIMED_OUT`, `REFUSED`, and `FAILED` are mapped
+directly from the structured outcome. For patches, `SUCCEEDED`, `CONFLICT`, approval terminal states,
+`REFUSED`, and `FAILED` are likewise structured mappings. Once ToolHub applies and consumes an
+immutable patch request, Repo Doctor submits discovered verification commands through `shell.run`.
+Completed verification is followed by ToolHub `git.diff`, whose bounded summary remains available
+for operator review and trace correlation.
+
+The MCP repair workflow deliberately does not perform a hidden local rollback. If ToolHub has applied the
 approved patch and verification later fails, the session ends in `VERIFICATION_FAILED` and leaves
 the change visible in ToolHub's Git diff. A correction or revert therefore remains an explicit,
 reviewable follow-up. Local repair remains the default and preserves its existing exact-byte
@@ -110,7 +176,7 @@ A real end-to-end repair: Repo Doctor analyzes repository evidence, builds a beh
 
 ## Verified in v0.3.0
 
-- Automated test suite: **153 passed, 4 skipped**.
+- Automated test suite: **227 passed, 5 skipped**.
 - Repo Doctor self-scan: **100/100**.
 - Real DeepSeek API semantic analysis and AI dry-run tested.
 - Real AI fix, verification, and keep workflow tested end to end.
@@ -319,11 +385,15 @@ python -m compileall -q repo_doctor tests
 repo-doctor scan tests\fixtures\python_project
 ```
 
-The real ToolHub integration, including approval, resume, consumption, and replay protection, is
-opt-in and keeps its approval/audit state in the pytest temporary directory:
+The real ToolHub Contract V1 integration uses the production stdio process, real MCP
+`ClientSession`, real capabilities/status calls, and the actual `mcp-toolhub-admin` executable. It
+covers patch and shell approval, command failure, rejection, unknown requests, trace continuity,
+consumption, and replay avoidance. The test is opt-in and keeps ToolHub and Repo Doctor state in
+separate pytest temporary directories:
 
 ```powershell
 $env:REPO_DOCTOR_RUN_TOOLHUB_INTEGRATION = "1"
+$env:REPO_DOCTOR_TOOLHUB_PROJECT = "D:\mcp-toolhub"
 uv run --extra dev python -m pytest -m integration
 ```
 

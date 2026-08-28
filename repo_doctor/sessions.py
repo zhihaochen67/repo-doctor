@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,9 +20,14 @@ from .analyzer import analyze, apply_ai_score
 from .backends import MCPToolBackend
 from .models import CommandResult, ScanResult
 from .security import redact_sensitive_text
+from .toolhub_contract import (
+    ContractOutcome,
+    RequestStatusResult,
+    expected_resume_tool,
+)
 
 STATE_ROOT_ENV = "REPO_DOCTOR_STATE_ROOT"
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 SESSIONS_DIRECTORY_NAME = "sessions"
 MAX_SESSION_BYTES = 1_000_000
 MAX_PERSISTED_OUTPUT_CHARS = 4_000
@@ -40,6 +46,8 @@ class OperationStatus(StrEnum):
     REJECTED = "rejected"
     EXPIRED = "expired"
     CONSUMED = "consumed"
+    REFUSED = "refused"
+    FAILED = "failed"
     UNKNOWN = "unknown"
 
 
@@ -63,6 +71,10 @@ class ApprovalOperation:
     command_index: int
     name: str
     command: tuple[str, ...]
+    toolhub_outcome: str | None
+    resume_tool: str | None
+    expires_at: str | None
+    trace_id: str | None
 
 
 @dataclass
@@ -94,7 +106,15 @@ class ApprovedExecutionBackend(Protocol):
 
     def __exit__(self, *exc_info: object) -> None: ...
 
-    def run_approved(self, request_id: str, *, name: str) -> CommandResult: ...
+    def request_status(self, request_id: str) -> RequestStatusResult: ...
+
+    def run_approved(
+        self,
+        request_id: str,
+        *,
+        name: str,
+        resume_tool: str | None = None,
+    ) -> CommandResult: ...
 
 
 def create_scan_session(result: ScanResult) -> ScanSession:
@@ -104,7 +124,12 @@ def create_scan_session(result: ScanResult) -> ScanSession:
     for index, command in enumerate(result.commands):
         if not command.approval_required:
             continue
+        if command.toolhub_outcome != ContractOutcome.APPROVAL_REQUIRED.value:
+            raise SessionError("Pending command is not a Contract V1 APPROVAL_REQUIRED result.")
         request_id = _request_id(command.request_id, f"command {index} request_id")
+        resume_tool = _expected_resume_tool(command.resume_tool, "shell.run")
+        trace_id = _required_text(command.trace_id, f"command {index} trace_id")
+        expires_at = _timestamp(command.expires_at, f"command {index} expires_at")
         operations.append(
             ApprovalOperation(
                 operation_id=f"verification-{index + 1}",
@@ -114,6 +139,10 @@ def create_scan_session(result: ScanResult) -> ScanSession:
                 command_index=index,
                 name=command.name,
                 command=command.command,
+                toolhub_outcome=command.toolhub_outcome,
+                resume_tool=resume_tool,
+                expires_at=expires_at,
+                trace_id=trace_id,
             )
         )
     if not operations:
@@ -173,13 +202,13 @@ def save_session(session: ScanSession, *, root: Path | None = None) -> Path:
     session.status = _derive_session_status(session.operations)
     payload = _session_to_data(session)
     _session_from_data(payload)
+    encoded = encode_session_payload(payload)
     destination = session_file_path(session.session_id, root=root)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.parent / f".{session.session_id}.{secrets.token_hex(8)}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-            stream.write("\n")
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         try:
@@ -191,6 +220,16 @@ def save_session(session: ScanSession, *, root: Path | None = None) -> Path:
         if temporary.exists():
             temporary.unlink()
     return destination
+
+
+def encode_session_payload(payload: object) -> bytes:
+    """Serialize exactly once and reject files the bounded loader cannot read."""
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    if len(encoded) > MAX_SESSION_BYTES:
+        raise SessionError(f"Session data exceeds the {MAX_SESSION_BYTES}-byte safety limit.")
+    return encoded
 
 
 def find_session_file(session_id: str, *, root: Path | None = None) -> Path:
@@ -248,7 +287,7 @@ def resume_scan_session(
     backend_factory: Callable[[Path], ApprovedExecutionBackend] | None = None,
     persist: Callable[[ScanSession], object] = save_session,
 ) -> ScanSession:
-    """Make progress on every still-pending request, persisting after each call."""
+    """Poll every unresolved request and execute only freshly APPROVED operations."""
     target = _canonical_existing_directory(session.target_path)
     if not _same_path(target, Path(session.target_repository)):
         raise SessionError("Stored target repository is not a canonical absolute path.")
@@ -261,14 +300,32 @@ def resume_scan_session(
         return session
     with factory(target) as backend:
         for operation in pending:
-            result = backend.run_approved(operation.request_id, name=operation.name)
-            if result.request_id != operation.request_id:
-                raise SessionError("ToolHub returned a different approval request ID.")
+            status = backend.request_status(operation.request_id)
+            _validate_status_correlation(operation, status)
+            _record_status(session, operation, status)
+            persist(session)
+            if status.outcome is not ContractOutcome.APPROVAL_APPROVED:
+                continue
+            approval = status.approval
+            if approval is None:  # Contract parser already enforces this.
+                raise SessionError("APPROVAL_APPROVED status has no approval handle.")
+            expected = expected_resume_tool("shell.run")
+            if approval.resume_tool != expected or operation.resume_tool != expected:
+                raise SessionError("ToolHub returned an unsafe shell resume_tool.")
+            result = backend.run_approved(
+                operation.request_id,
+                name=operation.name,
+                resume_tool=approval.resume_tool,
+            )
+            _validate_final_command(operation, result)
             if not result.command:
                 result = replace(result, command=operation.command)
             else:
                 operation.command = result.command
-            operation.status, result = _operation_outcome(result)
+            operation.status = _final_command_operation_status(result)
+            operation.toolhub_outcome = result.toolhub_outcome
+            operation.expires_at = result.expires_at or operation.expires_at
+            operation.resume_tool = result.resume_tool or operation.resume_tool
             session.result.commands[operation.command_index] = result
             _reanalyze(session.result)
             session.status = _derive_session_status(session.operations)
@@ -276,23 +333,103 @@ def resume_scan_session(
     return session
 
 
-def _operation_outcome(result: CommandResult) -> tuple[OperationStatus, CommandResult]:
-    if result.executed:
-        return OperationStatus.COMPLETED, result
-    outcomes = {
-        "PENDING": OperationStatus.PENDING,
-        "REJECTED": OperationStatus.REJECTED,
-        "EXPIRED": OperationStatus.EXPIRED,
-        "CONSUMED": OperationStatus.CONSUMED,
+def _validate_status_correlation(
+    operation: ApprovalOperation,
+    status: RequestStatusResult,
+) -> None:
+    if status.request_id != operation.request_id:
+        raise SessionError("ToolHub returned a different approval request ID.")
+    if status.outcome is ContractOutcome.REFUSED and (
+        status.error is not None and status.error.code == "REQUEST_NOT_FOUND"
+    ):
+        return
+    if status.trace_id != operation.trace_id:
+        raise SessionError("ToolHub lifecycle trace_id changed for the approval request.")
+    if status.approval is not None:
+        expected = expected_resume_tool("shell.run")
+        if status.approval.resume_tool != expected:
+            raise SessionError("ToolHub status returned an unsafe shell resume_tool.")
+
+
+def _record_status(
+    session: ScanSession,
+    operation: ApprovalOperation,
+    status: RequestStatusResult,
+) -> None:
+    mapping = {
+        ContractOutcome.APPROVAL_PENDING: OperationStatus.PENDING,
+        ContractOutcome.APPROVAL_APPROVED: OperationStatus.PENDING,
+        ContractOutcome.APPROVAL_REJECTED: OperationStatus.REJECTED,
+        ContractOutcome.APPROVAL_EXPIRED: OperationStatus.EXPIRED,
+        ContractOutcome.APPROVAL_CONSUMED: OperationStatus.CONSUMED,
+        ContractOutcome.REFUSED: OperationStatus.REFUSED,
     }
-    status = outcomes.get(result.approval_status)
-    if status is not None:
-        return status, result
-    if result.approval_status == "APPROVED":
-        detail = "ToolHub reported APPROVED but did not execute the request."
-        message = f"{detail} {result.message}".strip()
-        result = replace(result, approval_status=None, message=message)
-    return OperationStatus.UNKNOWN, result
+    operation.status = mapping[status.outcome]
+    if status.outcome is ContractOutcome.REFUSED and (
+        status.error is not None and status.error.code == "REQUEST_NOT_FOUND"
+    ):
+        operation.status = OperationStatus.UNKNOWN
+    operation.toolhub_outcome = status.outcome.value
+    if status.approval is not None:
+        operation.resume_tool = status.approval.resume_tool
+        operation.expires_at = status.approval.expires_at
+    command = session.result.commands[operation.command_index]
+    approval_status = status.approval.status.value if status.approval else None
+    message = status.error.message if status.error else command.message
+    session.result.commands[operation.command_index] = replace(
+        command,
+        approval_required=status.outcome is ContractOutcome.APPROVAL_PENDING,
+        approval_status=approval_status,
+        message=message,
+        toolhub_outcome=status.outcome.value,
+        resume_tool=status.approval.resume_tool if status.approval else operation.resume_tool,
+        expires_at=status.approval.expires_at if status.approval else operation.expires_at,
+        error_code=status.error.code if status.error else None,
+        error_retryable=status.error.retryable if status.error else None,
+    )
+    _reanalyze(session.result)
+    session.status = _derive_session_status(session.operations)
+
+
+def _validate_final_command(operation: ApprovalOperation, result: CommandResult) -> None:
+    if result.request_id != operation.request_id:
+        raise SessionError("ToolHub returned a different approval request ID.")
+    if result.trace_id != operation.trace_id:
+        raise SessionError("ToolHub approved execution returned a different lifecycle trace_id.")
+    allowed = {
+        ContractOutcome.SUCCEEDED.value,
+        ContractOutcome.COMMAND_FAILED.value,
+        ContractOutcome.TIMED_OUT.value,
+        ContractOutcome.APPROVAL_PENDING.value,
+        ContractOutcome.APPROVAL_REJECTED.value,
+        ContractOutcome.APPROVAL_EXPIRED.value,
+        ContractOutcome.APPROVAL_CONSUMED.value,
+        ContractOutcome.REFUSED.value,
+        ContractOutcome.FAILED.value,
+    }
+    if result.toolhub_outcome not in allowed:
+        raise SessionError("ToolHub returned an invalid shell resume outcome.")
+
+
+def _final_command_operation_status(result: CommandResult) -> OperationStatus:
+    if (
+        result.toolhub_outcome
+        in {
+            ContractOutcome.SUCCEEDED.value,
+            ContractOutcome.COMMAND_FAILED.value,
+            ContractOutcome.TIMED_OUT.value,
+        }
+        and result.executed
+    ):
+        return OperationStatus.COMPLETED
+    return {
+        ContractOutcome.APPROVAL_PENDING.value: OperationStatus.PENDING,
+        ContractOutcome.APPROVAL_REJECTED.value: OperationStatus.REJECTED,
+        ContractOutcome.APPROVAL_EXPIRED.value: OperationStatus.EXPIRED,
+        ContractOutcome.APPROVAL_CONSUMED.value: OperationStatus.CONSUMED,
+        ContractOutcome.REFUSED.value: OperationStatus.REFUSED,
+        ContractOutcome.FAILED.value: OperationStatus.FAILED,
+    }.get(result.toolhub_outcome, OperationStatus.UNKNOWN)
 
 
 def _reanalyze(result: ScanResult) -> None:
@@ -378,6 +515,10 @@ def _session_to_data(session: ScanSession) -> dict[str, Any]:
                 "command_index": item.command_index,
                 "name": item.name,
                 "command": list(item.command),
+                "toolhub_outcome": item.toolhub_outcome,
+                "resume_tool": item.resume_tool,
+                "expires_at": item.expires_at,
+                "trace_id": item.trace_id,
             }
             for item in session.operations
         ],
@@ -416,6 +557,12 @@ def _command_to_data(result: CommandResult) -> dict[str, Any]:
         "request_id": result.request_id,
         "toolhub_approval_status": result.approval_status,
         "message": _safe_text(result.message),
+        "toolhub_outcome": result.toolhub_outcome,
+        "resume_tool": result.resume_tool,
+        "expires_at": result.expires_at,
+        "trace_id": result.trace_id,
+        "error_code": result.error_code,
+        "error_retryable": result.error_retryable,
     }
 
 
@@ -436,6 +583,7 @@ def _finding_to_data(item: SemanticFinding) -> dict[str, Any]:
 
 
 def _session_from_data(value: object) -> ScanSession:
+    value = _migrate_v1_session(value)
     data = _object(
         value,
         "session",
@@ -493,6 +641,60 @@ def _session_from_data(value: object) -> ScanSession:
         operations=operations,
         schema_version=version,
     )
+
+
+def _migrate_v1_session(value: object) -> object:
+    """Read schema v1 without transferring its requests any approval authority."""
+    if not isinstance(value, dict):
+        return value
+    version = value.get("schema_version")
+    if version != 1:
+        return value
+    migrated = deepcopy(value)
+    operations = migrated.get("operations")
+    scan = migrated.get("scan")
+    commands = scan.get("commands") if isinstance(scan, dict) else None
+    if not isinstance(operations, list) or not isinstance(commands, list):
+        return migrated
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        if operation.get("status") == OperationStatus.PENDING.value:
+            operation["status"] = OperationStatus.UNKNOWN.value
+        operation.update(
+            {
+                "toolhub_outcome": None,
+                "resume_tool": None,
+                "expires_at": None,
+                "trace_id": None,
+            }
+        )
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        if command.get("approval_required"):
+            command["approval_required"] = False
+            command["toolhub_approval_status"] = None
+            detail = "Schema-v1 request is non-resumable under Contract V1."
+            command["message"] = f"{detail} {command.get('message', '')}".strip()
+        command.update(
+            {
+                "toolhub_outcome": None,
+                "resume_tool": None,
+                "expires_at": None,
+                "trace_id": None,
+                "error_code": None,
+                "error_retryable": None,
+            }
+        )
+    statuses = [item.get("status") for item in operations if isinstance(item, dict)]
+    migrated["status"] = (
+        SessionStatus.COMPLETED.value
+        if statuses and all(item == OperationStatus.COMPLETED.value for item in statuses)
+        else SessionStatus.UNABLE_TO_CONTINUE.value
+    )
+    migrated["schema_version"] = SESSION_SCHEMA_VERSION
+    return migrated
 
 
 def _scan_from_data(value: object, target: Path) -> ScanResult:
@@ -560,12 +762,18 @@ def _command_from_data(value: object, index: int) -> CommandResult:
             "request_id",
             "toolhub_approval_status",
             "message",
+            "toolhub_outcome",
+            "resume_tool",
+            "expires_at",
+            "trace_id",
+            "error_code",
+            "error_retryable",
         },
     )
     status = data["toolhub_approval_status"]
     if status is not None:
         status = _text(status, f"{label}.toolhub_approval_status")
-        if status not in {"PENDING", "REJECTED", "EXPIRED", "CONSUMED"}:
+        if status not in {"PENDING", "APPROVED", "REJECTED", "EXPIRED", "CONSUMED"}:
             raise SessionError(f"{label}.toolhub_approval_status is invalid.")
     request_id = data["request_id"]
     if request_id is not None:
@@ -576,6 +784,15 @@ def _command_from_data(value: object, index: int) -> CommandResult:
     duration = float(duration)
     if duration < 0 or not math.isfinite(duration):
         raise SessionError(f"{label}.duration must be a non-negative finite number.")
+    outcome = data["toolhub_outcome"]
+    if outcome is not None:
+        try:
+            outcome = ContractOutcome(_text(outcome, f"{label}.toolhub_outcome")).value
+        except ValueError as error:
+            raise SessionError(f"{label}.toolhub_outcome is invalid.") from error
+    error_retryable = data["error_retryable"]
+    if error_retryable is not None:
+        error_retryable = _boolean(error_retryable, f"{label}.error_retryable")
     return CommandResult(
         name=_text(data["name"], f"{label}.name"),
         command=tuple(_text_list(data["command"], f"{label}.command")),
@@ -589,6 +806,12 @@ def _command_from_data(value: object, index: int) -> CommandResult:
         approval_status=status,
         message=_text(data["message"], f"{label}.message", max_length=MAX_PERSISTED_OUTPUT_CHARS),
         executed=_boolean(data["executed"], f"{label}.executed"),
+        trace_id=_optional_text(data["trace_id"], f"{label}.trace_id"),
+        toolhub_outcome=outcome,
+        resume_tool=_optional_text(data["resume_tool"], f"{label}.resume_tool"),
+        expires_at=_optional_timestamp(data["expires_at"], f"{label}.expires_at"),
+        error_code=_optional_text(data["error_code"], f"{label}.error_code"),
+        error_retryable=error_retryable,
     )
 
 
@@ -605,6 +828,10 @@ def _operation_from_data(value: object, index: int) -> ApprovalOperation:
             "command_index",
             "name",
             "command",
+            "toolhub_outcome",
+            "resume_tool",
+            "expires_at",
+            "trace_id",
         },
     )
     try:
@@ -622,6 +849,10 @@ def _operation_from_data(value: object, index: int) -> ApprovalOperation:
         command_index=_nonnegative_integer(data["command_index"], f"{label}.command_index"),
         name=_text(data["name"], f"{label}.name"),
         command=tuple(_text_list(data["command"], f"{label}.command")),
+        toolhub_outcome=_optional_outcome(data["toolhub_outcome"], f"{label}.toolhub_outcome"),
+        resume_tool=_optional_text(data["resume_tool"], f"{label}.resume_tool"),
+        expires_at=_optional_timestamp(data["expires_at"], f"{label}.expires_at"),
+        trace_id=_optional_text(data["trace_id"], f"{label}.trace_id"),
     )
 
 
@@ -642,14 +873,41 @@ def _validate_operations(
             operation.request_id != command.request_id
             or operation.name != command.name
             or operation.command != command.command
+            or operation.trace_id != command.trace_id
         ):
             raise SessionError("Operation metadata does not match its scan command.")
-        if operation.status is OperationStatus.PENDING and (
-            not command.approval_required
-            or command.approval_status != "PENDING"
-            or command.executed
-        ):
-            raise SessionError("Pending operation does not contain a pending ToolHub result.")
+        if operation.resume_tool is not None:
+            _expected_resume_tool(operation.resume_tool, "shell.run")
+        if operation.status is OperationStatus.PENDING:
+            if (
+                operation.trace_id is None
+                or operation.expires_at is None
+                or operation.resume_tool is None
+                or operation.toolhub_outcome
+                not in {
+                    ContractOutcome.APPROVAL_REQUIRED.value,
+                    ContractOutcome.APPROVAL_PENDING.value,
+                    ContractOutcome.APPROVAL_APPROVED.value,
+                }
+                or command.executed
+            ):
+                raise SessionError("Pending operation lacks valid Contract V1 approval metadata.")
+            if operation.toolhub_outcome != command.toolhub_outcome:
+                raise SessionError("Pending operation outcome does not match its command result.")
+            if (
+                operation.toolhub_outcome
+                in {
+                    ContractOutcome.APPROVAL_REQUIRED.value,
+                    ContractOutcome.APPROVAL_PENDING.value,
+                }
+                and command.approval_status != "PENDING"
+            ):
+                raise SessionError("Pending ToolHub outcome must retain PENDING approval state.")
+            if (
+                operation.toolhub_outcome == ContractOutcome.APPROVAL_APPROVED.value
+                and command.approval_status != "APPROVED"
+            ):
+                raise SessionError("Approved ToolHub status is inconsistent in the session.")
         if operation.status is OperationStatus.COMPLETED and not command.executed:
             raise SessionError("Completed operation does not contain an executed result.")
         if operation.status not in {OperationStatus.PENDING, OperationStatus.COMPLETED} and (
@@ -713,6 +971,48 @@ def _text(value: object, label: str, *, max_length: int = 20_000) -> str:
     if not isinstance(value, str) or len(value) > max_length or "\x00" in value:
         raise SessionError(f"{label} must be bounded text without null bytes.")
     return value
+
+
+def _required_text(value: object, label: str) -> str:
+    text = _text(value, label)
+    if not text:
+        raise SessionError(f"{label} must be non-empty text.")
+    return text
+
+
+def _optional_text(value: object, label: str) -> str | None:
+    return None if value is None else _text(value, label)
+
+
+def _timestamp(value: object, label: str) -> str:
+    text = _required_text(value, label)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise SessionError(f"{label} must be an ISO-8601 timestamp.") from error
+    if parsed.tzinfo is None:
+        raise SessionError(f"{label} must include a timezone.")
+    return text
+
+
+def _optional_timestamp(value: object, label: str) -> str | None:
+    return None if value is None else _timestamp(value, label)
+
+
+def _optional_outcome(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return ContractOutcome(_text(value, label)).value
+    except ValueError as error:
+        raise SessionError(f"{label} is invalid.") from error
+
+
+def _expected_resume_tool(value: object, initial_tool: str) -> str:
+    expected = expected_resume_tool(initial_tool)
+    if value != expected:
+        raise SessionError(f"Approval handle resume_tool must be {expected!r} for {initial_tool}.")
+    return expected
 
 
 def _text_list(value: object, label: str) -> list[str]:

@@ -143,8 +143,8 @@ def _print_approval_instructions(session: ScanSession) -> None:
         console.print(f"\n{operation.name}:", markup=False)
         console.print(f"  request_id: {operation.request_id}", markup=False)
     console.print("\nApprove the required requests with ToolHub's trusted admin CLI:")
-    console.print(r"  cd D:\mcp-toolhub", markup=False)
-    console.print("  uv run python -m toolhub.admin approve <request_id>", markup=False)
+    console.print("  mcp-toolhub-admin list", markup=False)
+    console.print("  mcp-toolhub-admin approve <request_id>", markup=False)
     console.print(f"\nThen run from {session.target_repository}:", markup=False)
     console.print(f"  repo-doctor resume {session.session_id}", markup=False)
 
@@ -165,8 +165,8 @@ def _print_repair_approval_instructions(session: RepairSession) -> None:
         console.print(f"\n{operation.name}:", markup=False)
         console.print(f"  Request: {operation.request_id}", markup=False)
     console.print("\nApprove with ToolHub's trusted admin CLI:")
-    console.print(r"  cd D:\mcp-toolhub", markup=False)
-    console.print("  uv run python -m toolhub.admin approve <request_id>", markup=False)
+    console.print("  mcp-toolhub-admin list", markup=False)
+    console.print("  mcp-toolhub-admin approve <request_id>", markup=False)
     console.print("\nResume:")
     console.print(f"  repo-doctor resume {session.session_id}", markup=False)
 
