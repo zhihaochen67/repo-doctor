@@ -338,7 +338,12 @@ def test_explicit_absolute_toolhub_project_is_canonical_and_project_bound(
     process = _toolhub_process(workspace)
 
     assert configured == project.resolve()
-    assert Path(process.command) == (project / ".venv" / "Scripts" / "python.exe").resolve()
+    expected_python = (
+        project / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else project / ".venv" / "bin" / "python"
+    )
+    assert Path(process.command) == expected_python.resolve()
     assert process.args == ("-m", "mcp_toolhub", "serve")
     assert process.cwd == project.resolve()
     assert Path(process.env["TOOLHUB_WORKSPACE_ROOT"]) == workspace.resolve()
