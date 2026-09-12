@@ -185,7 +185,10 @@ def test_mcp_scan_with_pending_command_creates_cli_session(
     monkeypatch.setattr("repo_doctor.cli.create_tool_backend", lambda *args: sentinel)
     monkeypatch.setattr("repo_doctor.cli.scan", lambda *args, **kwargs: result)
 
-    response = CliRunner().invoke(app, ["scan", ".", "--tool-backend", "mcp"])
+    response = CliRunner().invoke(
+        app,
+        ["scan", ".", "--tool-backend", "mcp", "--trusted-execution"],
+    )
 
     assert response.exit_code == 0, response.output
     assert "Approval required" in response.output

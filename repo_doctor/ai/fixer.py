@@ -25,7 +25,7 @@ from .prompts import DEFAULT_PROMPT_VARIANT
 from .provider import LLMProvider
 from .workflow import analyze_repository
 
-FixStatus = Literal["no_candidate", "dry_run", "kept", "rolled_back"]
+FixStatus = Literal["no_candidate", "preview", "dry_run", "kept", "rolled_back"]
 SEVERITY_ORDER = {
     Severity.CRITICAL: 4,
     Severity.HIGH: 3,
@@ -112,19 +112,25 @@ def execute_ai_fix(
     timeout: int = 120,
     dry_run: bool = False,
     scan_function: Callable[[Path, int], ScanResult] = scan,
+    trusted_execution: bool = False,
     task: str | None = None,
     prompt_variant: str = DEFAULT_PROMPT_VARIANT,
     report_path: Path | None = None,
 ) -> AIFixOutcome:
-    """Analyze, propose one patch, and either verify it or restore exact bytes."""
+    """Preview one patch, or explicitly opt into applying and verifying it."""
     report = RepairReport(
         prompt_variant=prompt_variant,
         task_provided=bool(task and task.strip()),
     )
     root = root.resolve()
-    verify_clean_git(root)
-    baseline = scan_function(root, timeout)
-    if not baseline.commands:
+    if trusted_execution:
+        verify_clean_git(root)
+    baseline = (
+        scan(root, timeout, verify=trusted_execution)
+        if scan_function is scan
+        else scan_function(root, timeout)
+    )
+    if trusted_execution and not baseline.commands:
         raise VerificationError(
             "AI fix requires at least one discovered test or lint command for verification."
         )
@@ -163,6 +169,10 @@ def execute_ai_fix(
         report.final_status = "dry_run"
         write_repair_report(report_path, report)
         return AIFixOutcome("dry_run", finding, proposal, preview, behavioral_contract=contract)
+    if not trusted_execution:
+        report.final_status = "safe_preview"
+        write_repair_report(report_path, report)
+        return AIFixOutcome("preview", finding, proposal, preview, behavioral_contract=contract)
 
     apply_patch(prepared)
     report.patch_applied = True
@@ -173,7 +183,11 @@ def execute_ai_fix(
         rollback_patch(prepared)
         raise
     try:
-        after = scan_function(root, timeout)
+        after = (
+            scan(root, timeout, verify=True)
+            if scan_function is scan
+            else scan_function(root, timeout)
+        )
         passed, verification = _verification_passed(baseline, after)
     except Exception as error:
         verification = f"Verification could not complete: {error}"

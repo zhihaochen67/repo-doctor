@@ -125,3 +125,4 @@ class ScanResult:
     ai_findings: list[SemanticFinding] = field(default_factory=list)
     ai_error: str | None = None
     ai_context_files: list[str] = field(default_factory=list)
+    verification_plan: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)

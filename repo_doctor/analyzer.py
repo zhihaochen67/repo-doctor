@@ -41,7 +41,7 @@ def analyze(result: ScanResult) -> None:
             f"{item.name} could not run because ToolHub request "
             f"{item.request_id or 'unknown'} is {state}."
         )
-    if not result.commands:
+    if not result.commands and not result.verification_plan:
         result.maintainability_issues.append("No supported test or lint commands were discovered.")
     result.deterministic_score = max(
         0, 100 - 25 * len(failed) - 10 * len(result.maintainability_issues)

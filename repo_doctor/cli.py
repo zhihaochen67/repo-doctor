@@ -34,7 +34,7 @@ from .sessions import (
     save_session,
 )
 
-app = typer.Typer(help="Safely diagnose and repair a local repository.", no_args_is_help=True)
+app = typer.Typer(help="Diagnose and repair a local repository.", no_args_is_help=True)
 console = Console()
 MAX_TASK_FILE_BYTES = 64_000
 
@@ -49,16 +49,31 @@ def scan_command(
         ToolBackendKind,
         typer.Option("--tool-backend", help="Tool execution backend: local or mcp."),
     ] = ToolBackendKind.LOCAL,
+    trusted_execution: Annotated[
+        bool,
+        typer.Option(
+            "--trusted-execution",
+            help=(
+                "Run discovered repository commands as the current user; commands are NOT "
+                "sandboxed."
+            ),
+        ),
+    ] = False,
 ) -> None:
-    """Scan REPOSITORY_PATH without modifying repository source files."""
+    """Statically scan REPOSITORY_PATH; optionally run trusted host verification."""
     try:
         session = None
         with console.status("[cyan]Examining repository…"):
             if tool_backend is ToolBackendKind.LOCAL:
-                result = scan(repository_path, timeout)
+                result = scan(repository_path, timeout, verify=trusted_execution)
             else:
                 backend = create_tool_backend(tool_backend, repository_path)
-                result = scan(repository_path, timeout, backend=backend)
+                result = scan(
+                    repository_path,
+                    timeout,
+                    backend=backend,
+                    verify=trusted_execution,
+                )
             if ai:
                 result.ai_requested = True
                 try:
@@ -192,7 +207,16 @@ def _repair_task(task: str | None, task_file: Path | None) -> str | None:
 def fix(
     repository_path: Path,
     timeout: int = 120,
-    ai: Annotated[bool, typer.Option("--ai", help="Enable one verified semantic repair.")] = False,
+    ai: Annotated[
+        bool,
+        typer.Option(
+            "--ai",
+            help=(
+                "Enable one constrained semantic repair; preview-only unless trusted execution "
+                "is enabled."
+            ),
+        ),
+    ] = False,
     prompt_variant: Annotated[
         str,
         typer.Option(
@@ -222,8 +246,18 @@ def fix(
             help="Write a structured, secret-safe local AI repair report.",
         ),
     ] = None,
+    trusted_execution: Annotated[
+        bool,
+        typer.Option(
+            "--trusted-execution",
+            help=(
+                "Run repository commands as the current user and apply AI patches; execution is "
+                "NOT sandboxed."
+            ),
+        ),
+    ] = False,
 ) -> None:
-    """Apply one safe fix to a clean Git repository, then verify it."""
+    """Apply one deterministic fix or preview an AI fix; host verification is opt-in."""
     root = repository_path.resolve()
     try:
         prompt_profile(prompt_variant)
@@ -246,13 +280,20 @@ def fix(
                     provider_from_env(prompt_variant=prompt_variant),
                     timeout=timeout,
                     dry_run=dry_run,
+                    trusted_execution=trusted_execution,
                     task=repair_task,
                 )
                 if outcome.status == "no_candidate":
                     console.print("[yellow]No high-confidence AI fix is available.[/yellow]")
-                elif outcome.status == "dry_run":
-                    console.print("[cyan]Proposed patch (dry run; no files changed):[/cyan]")
+                elif outcome.status in {"dry_run", "preview"}:
+                    label = "dry run" if outcome.status == "dry_run" else "safe preview"
+                    console.print(f"[cyan]Proposed patch ({label}; no files changed):[/cyan]")
                     console.print(outcome.diff)
+                    if outcome.status == "preview":
+                        console.print(
+                            "[yellow]Use --trusted-execution to submit the patch and run "
+                            "unsandboxed repository verification as the current user.[/yellow]"
+                        )
                 elif outcome.session is not None:
                     console.print(render_repair_session(outcome.session))
                     if outcome.session.pending_operations:
@@ -270,15 +311,22 @@ def fix(
                 provider_from_env(prompt_variant=prompt_variant),
                 timeout=timeout,
                 dry_run=dry_run,
+                trusted_execution=trusted_execution,
                 task=repair_task,
                 prompt_variant=prompt_variant,
                 report_path=report_json,
             )
             if outcome.status == "no_candidate":
                 console.print("[yellow]No high-confidence AI fix is available.[/yellow]")
-            elif outcome.status == "dry_run":
-                console.print("[cyan]Proposed patch (dry run; no files changed):[/cyan]")
+            elif outcome.status in {"dry_run", "preview"}:
+                label = "dry run" if outcome.status == "dry_run" else "safe preview"
+                console.print(f"[cyan]Proposed patch ({label}; no files changed):[/cyan]")
                 console.print(outcome.diff)
+                if outcome.status == "preview":
+                    console.print(
+                        "[yellow]Use --trusted-execution to apply the patch and run "
+                        "unsandboxed repository verification as the current user.[/yellow]"
+                    )
             elif outcome.status == "kept":
                 console.print("[green]Patch applied[/green]")
                 console.print("[green]Verification passed[/green]")
@@ -291,15 +339,19 @@ def fix(
                 raise typer.Exit(1)
             return
         verify_clean_git(root)
-        before = scan(root, timeout)
+        before = scan(root, timeout, verify=trusted_execution)
         change = apply_high_confidence_fix(root)
         if not change:
             console.print("[yellow]No high-confidence fix is available.[/yellow]")
             return
-        after = scan(root, timeout)
+        after = scan(root, timeout, verify=trusted_execution)
         succeeded = after.score >= before.score and all(item.passed for item in after.commands)
         if succeeded:
             console.print(f"[green]Fix succeeded:[/green] {change}")
+            if not trusted_execution:
+                console.print(
+                    "[yellow]Static validation only; repository commands were not run.[/yellow]"
+                )
         else:
             console.print(f"[red]Verification failed after fix:[/red] {change}")
             raise typer.Exit(1)

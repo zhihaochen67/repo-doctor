@@ -1,4 +1,4 @@
-"""Safe subprocess execution."""
+"""Explicitly opted-in host subprocess execution."""
 
 import subprocess
 import sys

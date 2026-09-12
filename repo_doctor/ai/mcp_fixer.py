@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..backends import MCPToolBackend, MutationConflictError
-from ..detector import discover_commands
 from ..repair_sessions import (
     RepairPhase,
     RepairSession,
@@ -42,10 +41,11 @@ def execute_mcp_ai_fix(
     *,
     timeout: int = 120,
     dry_run: bool = False,
+    trusted_execution: bool = False,
     backend_factory: Callable[[Path], MCPToolBackend] = MCPToolBackend,
     task: str | None = None,
 ) -> MCPFixOutcome:
-    """Diagnose one repair, then submit its exact patch to ToolHub.
+    """Diagnose one repair, then optionally submit its exact patch to ToolHub.
 
     No local patch application, local rollback, verification subprocess, or
     local Git subprocess is reachable from this function.
@@ -54,10 +54,9 @@ def execute_mcp_ai_fix(
     diagnosis_backend = backend_factory(root)
     baseline = scan(root, timeout, backend=diagnosis_backend, verify=False)
     verification_plan = tuple(
-        VerificationPlan(name, command)
-        for name, command in discover_commands(root, baseline.technologies)
+        VerificationPlan(name, command) for name, command in baseline.verification_plan
     )
-    if not verification_plan:
+    if trusted_execution and not verification_plan:
         raise VerificationError(
             "AI fix requires at least one discovered test or lint command for verification."
         )
@@ -74,9 +73,12 @@ def execute_mcp_ai_fix(
         raise PatchValidationError("Selected AI finding has no validated file context.")
 
     with backend_factory(root) as backend:
-        status = backend.git_status()
-        if not status.clean:
-            raise ValueError("Fix mode requires a clean worktree; commit or stash changes first.")
+        if trusted_execution:
+            status = backend.git_status()
+            if not status.clean:
+                raise ValueError(
+                    "Fix mode requires a clean worktree; commit or stash changes first."
+                )
         target = backend.read_file(finding.file)
         patch_context = FileContext(
             target.path,
@@ -94,8 +96,8 @@ def execute_mcp_ai_fix(
             expected_sha256=target.sha256,
         )
         preview = render_patch_diff(prepared)
-        if dry_run:
-            return MCPFixOutcome("dry_run", diff=preview)
+        if dry_run or not trusted_execution:
+            return MCPFixOutcome("dry_run" if dry_run else "preview", diff=preview)
 
         session = new_repair_session(
             root,

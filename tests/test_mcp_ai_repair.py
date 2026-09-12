@@ -706,6 +706,7 @@ def test_mcp_ai_repair_uses_read_hash_and_never_writes_locally(
     outcome = execute_mcp_ai_fix(
         tmp_path,
         DeterministicRepairProvider(),
+        trusted_execution=True,
         backend_factory=backend_factory(state),
     )
 
@@ -734,6 +735,7 @@ def test_mcp_ai_repair_plumbs_task_and_contract_without_changing_session_flow(
     outcome = execute_mcp_ai_fix(
         tmp_path,
         provider,
+        trusted_execution=True,
         task="Accept exact stock while preserving existing behavior.",
         backend_factory=backend_factory(state),
     )
@@ -746,6 +748,28 @@ def test_mcp_ai_repair_plumbs_task_and_contract_without_changing_session_flow(
     assert any("Satisfy the user task" in item for item in contract.must_fix)
     assert any("boundary-1" in item for item in contract.must_fix)
     assert outcome.session.pending_operations
+
+
+def test_mcp_static_baseline_does_not_claim_discovered_commands_are_missing(
+    tmp_path: Path,
+) -> None:
+    repair_repository(tmp_path)
+    state = SharedBackendState()
+    provider = DeterministicRepairProvider()
+
+    outcome = execute_mcp_ai_fix(
+        tmp_path,
+        provider,
+        backend_factory=backend_factory(state),
+    )
+
+    assert outcome.status == "preview"
+    assert provider.analysis_request.verifications == ()
+    assert not any(
+        "No supported test or lint commands" in item
+        for item in provider.analysis_request.deterministic_findings
+    )
+    assert not any(call[0] in {"run_command", "apply_patch"} for call in state.calls)
 
 
 def test_malformed_ai_patch_is_rejected_before_toolhub_mutation(
@@ -775,6 +799,7 @@ def test_stale_hash_conflict_persists_distinct_state_and_leaves_file_unchanged(
     outcome = execute_mcp_ai_fix(
         tmp_path,
         DeterministicRepairProvider(),
+        trusted_execution=True,
         backend_factory=backend_factory(state),
     )
 
@@ -1258,6 +1283,7 @@ def test_local_ai_fix_remains_the_default_cli_path(tmp_path: Path, monkeypatch) 
 
     assert response.exit_code == 0, response.output
     assert observed["root"] == tmp_path.resolve()
+    assert observed["kwargs"]["trusted_execution"] is False
     assert ToolBackendKind.LOCAL.value not in response.output
 
 
@@ -1285,6 +1311,7 @@ def test_mcp_fix_cli_passes_task_but_rejects_local_report_json(tmp_path: Path, m
 
     assert task_response.exit_code == 0, task_response.output
     assert observed["kwargs"]["task"] == "Preserve the public API."
+    assert observed["kwargs"]["trusted_execution"] is False
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("provider and MCP workflow must not be called")
@@ -1349,7 +1376,11 @@ def test_real_toolhub_ai_repair_approval_verification_diff_and_audit(
     monkeypatch.setenv("TOOLHUB_STATE_ROOT", str(toolhub_state))
     monkeypatch.setenv("REPO_DOCTOR_STATE_ROOT", str(state / "repo-doctor-state"))
 
-    outcome = execute_mcp_ai_fix(repository, DeterministicRepairProvider())
+    outcome = execute_mcp_ai_fix(
+        repository,
+        DeterministicRepairProvider(),
+        trusted_execution=True,
+    )
     assert outcome.session is not None
     session = outcome.session
     assert session.phase is RepairPhase.PATCH_PENDING

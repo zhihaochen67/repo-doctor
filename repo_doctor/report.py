@@ -2,13 +2,21 @@
 
 from .ai.models import SemanticFinding
 from .analyzer import AI_CONFIDENCE_THRESHOLD, AI_SCORE_PENALTIES
-from .models import CommandResult, ScanResult
+from .models import ScanResult
 from .security import redact_sensitive_text
 
 
-def _results(items: list[CommandResult], kind: str) -> str:
+def _results(result: ScanResult, kind: str) -> str:
+    items = result.commands
     selected = [item for item in items if kind.lower() in item.name.lower()]
     if not selected:
+        planned = [item for item in result.verification_plan if kind.lower() in item[0].lower()]
+        if planned:
+            commands = ", ".join(f"`{' '.join(command)}`" for _, command in planned)
+            return (
+                "Discovered but intentionally not run in safe mode: "
+                f"{commands}. Use `--trusted-execution` to run repository commands."
+            )
         return "No commands discovered."
     blocks = []
     for item in selected:
@@ -108,11 +116,11 @@ Analyzed `{result.path.name}` locally. Inspected configuration: {inspected}.
 
 ## Test Results
 
-{_results(result.commands, "test")}
+{_results(result, "test")}
 
 ## Lint Results
 
-{_results(result.commands, "lint")}
+{_results(result, "lint")}
 
 ## Potential Bugs
 

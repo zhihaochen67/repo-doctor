@@ -27,7 +27,7 @@ def test_scan_and_report_does_not_modify_source(tmp_path: Path) -> None:
     target = tmp_path / "project"
     shutil.copytree(FIXTURE, target)
     before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
-    result = scan(target)
+    result = scan(target, verify=True)
     after = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
     report = render_report(result)
     assert before == after
@@ -52,7 +52,7 @@ def test_cli_does_not_resolve_provider_without_ai(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("repo_doctor.cli.provider_from_env", fail_if_called)
     monkeypatch.setattr(
         "repo_doctor.cli.scan",
-        lambda root, timeout: ScanResult(root.resolve(), [], 0, 0, []),
+        lambda root, timeout, **_kwargs: ScanResult(root.resolve(), [], 0, 0, []),
     )
     response = CliRunner().invoke(app, ["scan", str(tmp_path)])
     assert response.exit_code == 0, response.output
@@ -64,7 +64,7 @@ def test_cli_ai_mode_reports_missing_configuration(tmp_path: Path, monkeypatch) 
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         "repo_doctor.cli.scan",
-        lambda root, timeout: ScanResult(root.resolve(), [], 0, 0, []),
+        lambda root, timeout, **_kwargs: ScanResult(root.resolve(), [], 0, 0, []),
     )
     response = CliRunner().invoke(app, ["scan", str(tmp_path), "--ai"])
     assert response.exit_code == 0, response.output
@@ -78,7 +78,7 @@ def test_cli_ai_mode_reports_invalid_request_timeout(tmp_path: Path, monkeypatch
     monkeypatch.setenv("REPO_DOCTOR_REQUEST_TIMEOUT", "invalid")
     monkeypatch.setattr(
         "repo_doctor.cli.scan",
-        lambda root, timeout: ScanResult(root.resolve(), [], 0, 0, []),
+        lambda root, timeout, **_kwargs: ScanResult(root.resolve(), [], 0, 0, []),
     )
     response = CliRunner().invoke(app, ["scan", str(tmp_path), "--ai"])
     assert response.exit_code == 0, response.output

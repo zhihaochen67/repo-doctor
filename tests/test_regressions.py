@@ -11,6 +11,7 @@ from repo_doctor.ai.workflow import analyze_repository
 from repo_doctor.detector import detect_technologies, discover_commands
 from repo_doctor.fixer import apply_high_confidence_fix, verify_clean_git
 from repo_doctor.models import CommandResult, ScanResult
+from repo_doctor.report import render_report
 from repo_doctor.runner import run_command
 from repo_doctor.security import redact_sensitive_text
 
@@ -141,7 +142,7 @@ def test_scan_excludes_symlinks_from_temporary_copy(tmp_path: Path, monkeypatch)
         return CommandResult(name, command, 0, "", "", 0.01)
 
     monkeypatch.setattr(scanner_module, "run_command", verify_copy)
-    result = scanner_module.scan(tmp_path)
+    result = scanner_module.scan(tmp_path, verify=True)
     assert all(command.passed for command in result.commands)
 
 
@@ -158,8 +159,56 @@ def test_scan_skips_broken_symlink_when_supported(tmp_path: Path, monkeypatch) -
         "run_command",
         lambda name, command, cwd, timeout: CommandResult(name, command, 0, "", "", 0.01),
     )
-    result = scanner_module.scan(tmp_path)
+    result = scanner_module.scan(tmp_path, verify=True)
     assert all(command.passed for command in result.commands)
+
+
+def _observable_pytest_repository(root: Path, sentinel: Path) -> None:
+    (root / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+    (root / "README.md").write_text("# Observable fixture\n", encoding="utf-8")
+    (root / "conftest.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+
+def test_default_scan_discovers_but_does_not_execute_repository_verification(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    sentinel = tmp_path / "pytest-executed"
+    _observable_pytest_repository(repository, sentinel)
+
+    result = scanner_module.scan(repository)
+
+    assert not sentinel.exists()
+    assert result.technologies == ["Python"]
+    assert result.files == 4
+    assert result.commands == []
+    assert result.verification_plan == [("Python tests", ("pytest",))]
+    assert "No supported test or lint commands were discovered." not in (
+        result.potential_bugs + result.maintainability_issues
+    )
+    report = render_report(result)
+    assert "Discovered but intentionally not run in safe mode: `pytest`" in report
+
+
+def test_trusted_execution_runs_discovered_repository_verification(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    sentinel = tmp_path / "pytest-executed"
+    _observable_pytest_repository(repository, sentinel)
+
+    result = scanner_module.scan(repository, verify=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "executed"
+    assert [item.name for item in result.commands] == ["Python tests"]
+    assert result.commands[0].passed
 
 
 @pytest.mark.parametrize(

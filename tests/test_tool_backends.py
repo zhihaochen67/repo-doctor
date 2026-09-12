@@ -265,8 +265,9 @@ def shell_outcome_response(outcome: str) -> dict:
 def test_local_backend_is_default_and_preserves_local_cli(tmp_path: Path, monkeypatch) -> None:
     observed = {}
 
-    def fake_scan(root, timeout):
+    def fake_scan(root, timeout, *, verify=False):
         observed["root"] = root
+        observed["verify"] = verify
         return ScanResult(root.resolve(), [], 0, 0, [])
 
     def unexpected_factory(*args, **kwargs):
@@ -279,6 +280,7 @@ def test_local_backend_is_default_and_preserves_local_cli(tmp_path: Path, monkey
 
     assert response.exit_code == 0, response.output
     assert observed["root"] == tmp_path
+    assert observed["verify"] is False
     assert isinstance(create_tool_backend(ToolBackendKind.LOCAL, tmp_path), LocalToolBackend)
 
 
@@ -291,8 +293,9 @@ def test_cli_backend_selection_passes_mcp_backend_to_scan(tmp_path: Path, monkey
         lambda kind, root: observed.update(kind=kind, root=root) or sentinel,
     )
 
-    def fake_scan(root, timeout, backend=None):
+    def fake_scan(root, timeout, backend=None, *, verify=False):
         observed["backend"] = backend
+        observed["verify"] = verify
         return ScanResult(root.resolve(), [], 0, 0, [])
 
     monkeypatch.setattr("repo_doctor.cli.scan", fake_scan)
@@ -307,7 +310,26 @@ def test_cli_backend_selection_passes_mcp_backend_to_scan(tmp_path: Path, monkey
         "kind": ToolBackendKind.MCP,
         "root": tmp_path,
         "backend": sentinel,
+        "verify": False,
     }
+
+
+def test_cli_trusted_execution_explicitly_enables_verification(tmp_path: Path, monkeypatch) -> None:
+    observed = {}
+
+    def fake_scan(root, timeout, *, verify=False):
+        observed["verify"] = verify
+        return ScanResult(root.resolve(), [], 0, 0, [])
+
+    monkeypatch.setattr("repo_doctor.cli.scan", fake_scan)
+
+    response = CliRunner().invoke(
+        app,
+        ["scan", str(tmp_path), "--trusted-execution"],
+    )
+
+    assert response.exit_code == 0, response.output
+    assert observed["verify"] is True
 
 
 def test_mcp_launch_configuration_injects_one_absolute_workspace(
@@ -588,7 +610,7 @@ def test_mcp_scan_routes_reads_and_discovered_commands_through_backend(tmp_path:
     )
     backend, _ = make_backend(tmp_path, client)
 
-    result = scan(tmp_path, backend=backend)
+    result = scan(tmp_path, backend=backend, verify=True)
 
     names = [name for name, _ in client.calls]
     assert names.count("filesystem.read_file") == 3
@@ -805,7 +827,10 @@ def test_real_toolhub_approval_resume_and_replay_protection(tmp_path: Path, monk
 
     monkeypatch.chdir(repository)
     runner = CliRunner()
-    scan_response = runner.invoke(app, ["scan", ".", "--tool-backend", "mcp"])
+    scan_response = runner.invoke(
+        app,
+        ["scan", ".", "--tool-backend", "mcp", "--trusted-execution"],
+    )
     assert scan_response.exit_code == 0, scan_response.output
     assert "Approval required" in scan_response.output
     session_files = list((state / "repo-doctor-state" / "sessions").glob("*.json"))

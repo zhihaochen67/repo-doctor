@@ -33,7 +33,7 @@ COPY_EXCLUDES = (
 
 
 def _copy_ignore(directory: str, names: list[str]) -> set[str]:
-    """Exclude tool data and all symlinks from the isolated verification copy."""
+    """Exclude tool data and all symlinks from the verification staging copy."""
     ignored = set(shutil.ignore_patterns(*COPY_EXCLUDES)(directory, names))
     parent = Path(directory)
     ignored.update(name for name in names if (parent / name).is_symlink())
@@ -45,9 +45,9 @@ def scan(
     timeout: int = 120,
     backend: ToolBackend | None = None,
     *,
-    verify: bool = True,
+    verify: bool = False,
 ) -> ScanResult:
-    """Inspect *root* and verify a temporary copy, leaving the source untouched."""
+    """Inspect *root* statically and optionally run trusted host verification."""
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"Repository path is not a directory: {root}")
@@ -71,11 +71,19 @@ def scan(
             )
         )
         technologies = detect_technologies(root)
-        result = ScanResult(root, technologies, len(files), lines, inspected)
+        verification_plan = discover_commands(root, technologies)
+        result = ScanResult(
+            root,
+            technologies,
+            len(files),
+            lines,
+            inspected,
+            verification_plan=verification_plan,
+        )
         if not verify:
             pass
         elif backend.verification_in_place:
-            for name, command in discover_commands(root, technologies):
+            for name, command in verification_plan:
                 result.commands.append(backend.run_command(name, command, ".", timeout))
         else:
             with tempfile.TemporaryDirectory(prefix="repo-doctor-") as temporary:
@@ -85,7 +93,7 @@ def scan(
                     copy,
                     ignore=_copy_ignore,
                 )
-                for name, command in discover_commands(copy, technologies):
+                for name, command in verification_plan:
                     result.commands.append(run_command(name, command, copy, timeout))
     analyze(result)
     return result
