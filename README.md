@@ -1,6 +1,6 @@
 # Repo Doctor
 
-[![CI](https://github.com/asxvgxkep/repo-doctor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asxvgxkep/repo-doctor/actions/workflows/ci.yml)
+[![CI](https://github.com/zhihaochen67/repo-doctor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zhihaochen67/repo-doctor/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 ![Release v0.3.0](https://img.shields.io/badge/release-v0.3.0-2563eb)
 ![Tests: 232 passed, 5 skipped](https://img.shields.io/badge/tests-232%20passed%2C%205%20skipped-16a34a)
